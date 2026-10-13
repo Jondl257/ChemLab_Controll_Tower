@@ -125,6 +125,13 @@ def _sample_form(repo):
     ])
 
 
+def local_user_records(repo):
+    return [
+        {**user, "id": user["username"]}
+        for user in repo.local_users()
+    ]
+
+
 def layout(repo, is_admin=False):
     tasks = task_view(repo)
     masks = queue_masks(tasks)
@@ -170,6 +177,44 @@ def layout(repo, is_admin=False):
             dcc.Input(id="result-comment", type="text", placeholder="Kommentar"),
             html.Button("Messung erfassen", id="record", className="primary"),
         ], className="action-row"),
+        html.H4("Beaufsichtigte Auftragsänderungen (Laborleitung)"),
+        html.Div([
+            dcc.Dropdown(
+                [
+                    {"label": "Normal", "value": "Normal"},
+                    {"label": "Hoch", "value": "Hoch"},
+                    {"label": "Kritisch", "value": "Kritisch"},
+                    {"label": "Systemvorschlag übernehmen", "value": "Systemvorschlag"},
+                ],
+                id="task-priority",
+                placeholder="Priorität unverändert",
+                clearable=True,
+            ),
+            dcc.Input(
+                id="task-deadline",
+                type="datetime-local",
+                placeholder="Neue Fälligkeit",
+            ),
+            html.Button("Priorität/Frist ändern", id="task-controls-save", className="secondary"),
+        ], className="action-row"),
+        html.Div([
+            dcc.Dropdown(
+                [
+                    {"label": f"{row.employee} ({row.employee_id})", "value": row.employee_id}
+                    for row in repo.table("employees").itertuples()
+                    if row.role == "Laborant"
+                ],
+                id="task-reassign-employee",
+                placeholder="Ziel-Laborant",
+                clearable=True,
+            ),
+            html.Button("Neu zuweisen", id="task-reassign", className="secondary"),
+            html.Button("Abgebrochenen Auftrag wiedereröffnen", id="task-reopen", className="secondary"),
+        ], className="action-row"),
+        dcc.Textarea(
+            id="task-change-reason",
+            placeholder="Begründung für Änderung, Neuzuweisung oder Wiedereröffnung (erforderlich)",
+        ),
         html.Div(id="workflow-message", className="message"),
     ])
     admin_panel = []
@@ -192,14 +237,30 @@ def layout(repo, is_admin=False):
                 "E-01", id="local-user-employee", clearable=True,
             ),
             html.Button("Lokales Konto anlegen", id="local-user-create", className="primary"),
+            html.Div([
+                dcc.Input(
+                    id="local-user-reset-password",
+                    type="password",
+                    placeholder="Neues Kennwort (mindestens 12 Zeichen)",
+                ),
+                html.Button("Kennwort zurücksetzen", id="local-user-reset", className="secondary"),
+                html.Button("Konto deaktivieren", id="local-user-deactivate", className="secondary"),
+                html.Button("Konto aktivieren", id="local-user-activate", className="secondary"),
+            ], className="action-row"),
+            html.P(
+                "Für Kontoaktionen zuerst genau einen Eintrag auswählen. Das letzte aktive "
+                "Administratorkonto kann nicht deaktiviert werden.",
+                className="note",
+            ),
             html.Div(id="local-user-message", className="message"),
             dash_table.DataTable(
-                repo.local_users(),
+                local_user_records(repo),
                 [{"name": label, "id": column} for column, label in (
                     ("username", "Benutzer"), ("role", "Rolle"), ("employee_id", "Mitarbeiter"),
                     ("active", "Aktiv"), ("created_at", "Angelegt"), ("created_by", "Erstellt von"),
                 )],
                 id="local-user-list",
+                row_selectable="single",
                 page_size=10,
             ),
         ])]

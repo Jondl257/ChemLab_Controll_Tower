@@ -212,11 +212,18 @@ def test_release_uses_stable_selected_row_id_and_refreshes_queue(isolated_logged
             {"id": "review", "property": "n_clicks", "value": 0},
             {"id": "release", "property": "n_clicks", "value": 1},
             {"id": "record", "property": "n_clicks", "value": 0},
+            {"id": "task-controls-save", "property": "n_clicks", "value": 0},
+            {"id": "task-reassign", "property": "n_clicks", "value": 0},
+            {"id": "task-reopen", "property": "n_clicks", "value": 0},
         ],
         [
             {"id": "queue", "property": "selected_row_ids", "value": [task.task_id]},
             {"id": "result-value", "property": "value", "value": None},
             {"id": "result-comment", "property": "value", "value": ""},
+            {"id": "task-priority", "property": "value", "value": None},
+            {"id": "task-deadline", "property": "value", "value": None},
+            {"id": "task-reassign-employee", "property": "value", "value": None},
+            {"id": "task-change-reason", "property": "value", "value": None},
             {"id": "queue-revision", "property": "data", "value": 0},
         ],
         "release.n_clicks",
@@ -227,3 +234,105 @@ def test_release_uses_stable_selected_row_id_and_refreshes_queue(isolated_logged
         local_repo.table("tasks").task_id == task.task_id, "status"
     ].iloc[0] == TaskStatus.RELEASED.value
     assert local_repo.events(task.task_id)
+
+
+def test_lab_lead_can_apply_reasoned_task_priority_change(isolated_logged_in_user):
+    local_repo = isolated_logged_in_user
+    task = local_repo.table("tasks").loc[
+        local_repo.table("tasks").status == TaskStatus.OPEN.value
+    ].iloc[0]
+    output = next(
+        key for key in app.callback_map
+        if key.startswith("..workflow-message.children...")
+    )
+    outputs = [
+        {"id": item.component_id, "property": item.component_property}
+        for item in app.callback_map[output]["output"]
+    ]
+    response = callback_request(
+        output,
+        outputs,
+        [
+            {"id": "claim", "property": "n_clicks", "value": 0},
+            {"id": "start", "property": "n_clicks", "value": 0},
+            {"id": "review", "property": "n_clicks", "value": 0},
+            {"id": "release", "property": "n_clicks", "value": 0},
+            {"id": "record", "property": "n_clicks", "value": 0},
+            {"id": "task-controls-save", "property": "n_clicks", "value": 1},
+            {"id": "task-reassign", "property": "n_clicks", "value": 0},
+            {"id": "task-reopen", "property": "n_clicks", "value": 0},
+        ],
+        [
+            {"id": "queue", "property": "selected_row_ids", "value": [task.task_id]},
+            {"id": "result-value", "property": "value", "value": None},
+            {"id": "result-comment", "property": "value", "value": ""},
+            {"id": "task-priority", "property": "value", "value": "Kritisch"},
+            {"id": "task-deadline", "property": "value", "value": None},
+            {"id": "task-reassign-employee", "property": "value", "value": None},
+            {"id": "task-change-reason", "property": "value", "value": "Produktionsengpass"},
+            {"id": "queue-revision", "property": "data", "value": 0},
+        ],
+        "task-controls-save.n_clicks",
+    )
+    assert response.status_code == 200
+    assert response.get_json()["response"]["workflow-message"]["children"].startswith(
+        f"{task.task_id}: Aktion erfolgreich"
+    )
+    adjusted = local_repo.table("tasks").loc[
+        local_repo.table("tasks").task_id == task.task_id
+    ].iloc[0]
+    assert adjusted.priority == "Kritisch"
+
+
+def test_admin_account_management_callback_deactivates_selected_account(isolated_logged_in_user):
+    local_repo = isolated_logged_in_user
+    with client.session_transaction() as user_session:
+        user_session["username"] = "admin"
+    output = next(
+        key for key in app.callback_map
+        if key.startswith("..local-user-message.children...")
+    )
+    outputs = [
+        {"id": item.component_id, "property": item.component_property}
+        for item in app.callback_map[output]["output"]
+    ]
+    response = callback_request(
+        output,
+        outputs,
+        [
+            {"id": "local-user-create", "property": "n_clicks", "value": 0},
+            {"id": "local-user-reset", "property": "n_clicks", "value": 0},
+            {"id": "local-user-deactivate", "property": "n_clicks", "value": 1},
+            {"id": "local-user-activate", "property": "n_clicks", "value": 0},
+        ],
+        [
+            {"id": "local-user-name", "property": "value", "value": None},
+            {"id": "local-user-password", "property": "value", "value": None},
+            {"id": "local-user-role", "property": "value", "value": "Laborant"},
+            {"id": "local-user-employee", "property": "value", "value": "E-01"},
+            {"id": "local-user-list", "property": "selected_row_ids", "value": ["lab"]},
+            {"id": "local-user-reset-password", "property": "value", "value": None},
+        ],
+        "local-user-deactivate.n_clicks",
+    )
+    assert response.status_code == 200
+    result = response.get_json()["response"]["local-user-message"]["children"]
+    assert result == "Konto 'lab' deaktiviert."
+    assert local_repo.local_user("lab")["active"] == 0
+
+
+def test_admin_page_renders_local_account_management_controls():
+    with client.session_transaction() as user_session:
+        user_session["username"] = "admin"
+    response = callback_request(
+        "page.children",
+        {"id": "page", "property": "children"},
+        [
+            {"id": "tabs", "property": "value", "value": "operations"},
+            {"id": "auth-revision", "property": "data", "value": 1},
+        ],
+    )
+    assert response.status_code == 200
+    content = str(response.get_json()["response"]["page"]["children"])
+    assert "Kennwort zurücksetzen" in content
+    assert "Konto deaktivieren" in content

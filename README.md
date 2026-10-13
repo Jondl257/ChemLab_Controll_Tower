@@ -36,7 +36,7 @@ Laboranten- und Laborleitungs-Konten müssen einem passenden Demo-Mitarbeiter zu
 .\.venv\Scripts\python.exe -m services.auth_service --username leitung --role Laborleitung --employee-id E-06
 ```
 
-Alternativ können Administratoren in der Operations-Ansicht weitere lokale Konten anlegen. Laboranten können Aufträge übernehmen und bearbeiten; Laborleitungen können Proben/Aufträge anlegen und Ergebnisse fachlich freigeben. Die Aktionen werden anhand des angemeldeten Kontos serverseitig autorisiert. Dies ist eine lokale Demo-Anmeldung, keine Unternehmens- oder Mehrfaktor-Authentifizierung.
+Alternativ können Administratoren in der Operations-Ansicht weitere lokale Konten anlegen, auswählen, aktivieren/deaktivieren und deren Kennwörter zurücksetzen. Das letzte aktive Administratorkonto kann nicht deaktiviert werden. Laboranten können Aufträge übernehmen und bearbeiten; Laborleitungen können Proben/Aufträge anlegen und Ergebnisse fachlich freigeben. Die Aktionen werden anhand des angemeldeten Kontos serverseitig autorisiert. Dies ist eine lokale Demo-Anmeldung, keine Unternehmens- oder Mehrfaktor-Authentifizierung.
 
 ## Persistenz und Konfiguration
 
@@ -51,13 +51,15 @@ Alternativ können Administratoren in der Operations-Ansicht weitere lokale Kont
 
 - Probenanlage mit mehreren getrennten Analyseaufträgen und idempotenter Absicherung doppelter Formularübermittlungen.
 - Persistente Queue, Suche, Frist-/Prioritäts-KPIs, Workflow-Aktionen und Rollenprüfung.
+- Lokale Administrationsfunktionen zum Anlegen, Aktivieren/Deaktivieren und Zurücksetzen von Benutzerkonten; Schutz vor Deaktivierung des letzten aktiven Administrators.
+- Beaufsichtigte Prioritäts-/Friständerung, Neuzuweisung und Wiedereröffnung abgebrochener Aufträge durch die Laborleitung mit verpflichtender Begründung und Audit-Ereignis.
 - Versionierte Messwerte mit Grenzwertstatus, Ergebnisprüfung/Freigabe und sichtbarer Historie.
 - Statistik über aktuelle freigegebene Ergebnisse, unter anderem gefiltert nach Produkt, Methode, Probenart, Parameter, Qualität und Zeitraum.
 - Audit-Ereignisse für wesentliche Anlage-, Mess- und Statusänderungen.
 
 ## Noch nicht vollständig umgesetzt
 
-Die Anwendung ist weiterhin ein Demonstrator und erfüllt noch nicht den vollständigen ursprünglichen Anforderungskatalog. Unter anderem fehlen eine vollständige Prüfplan-/Spezifikationsversionierung und Übernahme je Probe, Probe-Detailansicht mit Änderungsfunktionen, manuelle Prioritäts-/Fristkorrekturen, kontrollierte Wiedereröffnung und Neuzuweisung, eine vollständige OOS-Fallbewertung sowie die Qualitätsentscheidung auf Probenebene. Prüfplanregeln und weitere fachliche Vorgaben sind teilweise nur als Demo-Defaults umgesetzt.
+Die Anwendung ist weiterhin ein Demonstrator und erfüllt noch nicht den vollständigen ursprünglichen Anforderungskatalog. Unter anderem fehlen eine vollständige Prüfplan-/Spezifikationsversionierung und Übernahme je Probe, Probe-Detailansicht mit allgemeinen Stammdaten-Änderungsfunktionen sowie eine vollständige OOS-Fallbewertung und die Qualitätsentscheidung auf Probenebene. Freigegebene Aufträge können bewusst nicht wiedereröffnet werden; nur abgebrochene Aufträge ohne maßgebliches Ergebnis sind für die begründete Wiedereröffnung zugelassen. Prüfplanregeln und weitere fachliche Vorgaben sind teilweise nur als Demo-Defaults umgesetzt.
 
 Ergebnisfreigabe bezieht sich ausschließlich auf eine einzelne Demo-Ergebnisversion und ist **keine** Chargen-, Produkt- oder Produktionsfreigabe. Cp/Cpk und Kontrollgrenzen werden bei unzureichender bzw. nicht homogener Datenbasis ausgeblendet; diese Demo-Heuristik ist keine validierte Statistikregel.
 

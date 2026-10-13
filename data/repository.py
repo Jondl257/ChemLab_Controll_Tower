@@ -75,6 +75,7 @@ class Repository:
                 "system_priority": "TEXT",
                 "manual_priority": "TEXT",
                 "manual_priority_reason": "TEXT",
+                "manual_deadline_reason": "TEXT",
                 "specification_version": "TEXT",
                 "calculation_rule": "TEXT",
             },
@@ -374,6 +375,55 @@ class Repository:
             ).fetchall()
         names = ("username", "role", "employee_id", "active", "created_at", "created_by")
         return [dict(zip(names, row)) for row in rows]
+
+    def set_local_user_active(self, username: str, active: bool, actor: str) -> None:
+        normalized = username.strip().casefold()
+        with self.transaction():
+            user = self._connection.execute(
+                "SELECT role, active FROM local_users WHERE username=? COLLATE NOCASE",
+                (normalized,),
+            ).fetchone()
+            if user is None:
+                raise ValueError("Lokales Benutzerkonto nicht gefunden.")
+            if not active and user[0] == "Administrator":
+                active_admins = self._connection.execute(
+                    "SELECT COUNT(*) FROM local_users "
+                    "WHERE role='Administrator' AND active=1 AND username<>? COLLATE NOCASE",
+                    (normalized,),
+                ).fetchone()[0]
+                if active_admins == 0:
+                    raise ValueError("Das letzte aktive Administratorkonto kann nicht deaktiviert werden.")
+            if bool(user[1]) == active:
+                state = "aktiv" if active else "deaktiviert"
+                raise ValueError(f"Das Konto ist bereits {state}.")
+            self._connection.execute(
+                "UPDATE local_users SET active=? WHERE username=? COLLATE NOCASE",
+                (int(active), normalized),
+            )
+            self.log_event(
+                "local_user",
+                normalized,
+                "activated" if active else "deactivated",
+                actor,
+            )
+
+    def reset_local_user_password(
+        self, username: str, password_hash: str, actor: str
+    ) -> None:
+        normalized = username.strip().casefold()
+        with self.transaction():
+            updated = self._connection.execute(
+                "UPDATE local_users SET password_hash=? WHERE username=? COLLATE NOCASE",
+                (password_hash, normalized),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Lokales Benutzerkonto nicht gefunden.")
+            self.log_event(
+                "local_user",
+                normalized,
+                "password_reset",
+                actor,
+            )
 
     def close(self) -> None:
         with self._lock:

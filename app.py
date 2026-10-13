@@ -332,22 +332,62 @@ def create_sample(
     Output("local-user-message", "children"),
     Output("local-user-list", "data"),
     Input("local-user-create", "n_clicks"),
+    Input("local-user-reset", "n_clicks"),
+    Input("local-user-deactivate", "n_clicks"),
+    Input("local-user-activate", "n_clicks"),
     State("local-user-name", "value"),
     State("local-user-password", "value"),
     State("local-user-role", "value"),
     State("local-user-employee", "value"),
+    State("local-user-list", "selected_row_ids"),
+    State("local-user-reset-password", "value"),
     prevent_initial_call=True,
 )
-def create_local_user(clicks, username, password, role, employee_id):
-    if not clicks:
+def manage_local_users(
+    create_clicks,
+    reset_clicks,
+    deactivate_clicks,
+    activate_clicks,
+    username,
+    password,
+    role,
+    employee_id,
+    selected_ids,
+    reset_password_value,
+):
+    clicks_by_action = {
+        "local-user-create": create_clicks,
+        "local-user-reset": reset_clicks,
+        "local-user-deactivate": deactivate_clicks,
+        "local-user-activate": activate_clicks,
+    }
+    action = ctx.triggered_id
+    if not clicks_by_action.get(action):
         return no_update, no_update
     user = current_user()
     if user is None or user["role"] != "Administrator":
         return "Keine Änderung: Nur Administratoren dürfen lokale Konten verwalten.", no_update
     try:
-        from services.auth_service import add_user
-        add_user(repo, username or "", password or "", role, employee_id or None, user["username"])
-        return f"Konto '{username.strip()}' angelegt.", repo.local_users()
+        if action == "local-user-create":
+            from services.auth_service import add_user
+            add_user(repo, username or "", password or "", role, employee_id or None, user["username"])
+            message = f"Konto '{username.strip()}' angelegt."
+        else:
+            if len(selected_ids or []) != 1:
+                raise ValueError("Bitte genau ein lokales Benutzerkonto auswählen.")
+            selected_username = selected_ids[0]
+            if action == "local-user-reset":
+                from services.auth_service import reset_password
+                reset_password(
+                    repo, selected_username, reset_password_value or "", user["username"]
+                )
+                message = f"Kennwort für '{selected_username}' zurückgesetzt."
+            else:
+                active = action == "local-user-activate"
+                repo.set_local_user_active(selected_username, active, user["username"])
+                state = "aktiviert" if active else "deaktiviert"
+                message = f"Konto '{selected_username}' {state}."
+        return message, operations.local_user_records(repo)
     except ValueError as exc:
         return f"Keine Änderung: {exc}", no_update
 
@@ -360,14 +400,22 @@ def create_local_user(clicks, username, password, role, employee_id):
     Input("review", "n_clicks"),
     Input("release", "n_clicks"),
     Input("record", "n_clicks"),
+    Input("task-controls-save", "n_clicks"),
+    Input("task-reassign", "n_clicks"),
+    Input("task-reopen", "n_clicks"),
     State("queue", "selected_row_ids"),
     State("result-value", "value"),
     State("result-comment", "value"),
+    State("task-priority", "value"),
+    State("task-deadline", "value"),
+    State("task-reassign-employee", "value"),
+    State("task-change-reason", "value"),
     State("queue-revision", "data"),
     prevent_initial_call=True,
 )
 def apply_action(claim_clicks, start_clicks, review_clicks, release_clicks, record_clicks,
-                 selected_ids, value, comment, revision):
+                 controls_clicks, reassign_clicks, reopen_clicks, selected_ids, value,
+                 comment, priority, deadline_value, target_employee, change_reason, revision):
     action = ctx.triggered_id
     clicks_by_action = {
         "claim": claim_clicks,
@@ -375,13 +423,16 @@ def apply_action(claim_clicks, start_clicks, review_clicks, release_clicks, reco
         "review": review_clicks,
         "release": release_clicks,
         "record": record_clicks,
+        "task-controls-save": controls_clicks,
+        "task-reassign": reassign_clicks,
+        "task-reopen": reopen_clicks,
     }
     if not clicks_by_action.get(action):
         return no_update, no_update
     user = current_user()
     if user is None:
         return "Bitte zuerst lokal anmelden.", no_update
-    if not selected_ids:
+    if len(selected_ids or []) != 1:
         return "Bitte zuerst genau einen Analyseauftrag auswählen.", no_update
     task_id = selected_ids[0]
     employee_id = user["employee_id"]
@@ -399,6 +450,33 @@ def apply_action(claim_clicks, start_clicks, review_clicks, release_clicks, reco
             if value is None:
                 raise ValueError("Für die Messung ist ein Messwert erforderlich.")
             workflow.record_result(task_id, value, comment or "", actor=actor, actor_employee_id=employee_id, actor_role=user["role"])
+        elif action == "task-controls-save":
+            parsed_deadline = (
+                datetime.fromisoformat(deadline_value) if deadline_value else None
+            )
+            workflow.update_task_controls(
+                task_id,
+                actor=actor,
+                actor_role=user["role"],
+                reason=change_reason or "",
+                priority=priority,
+                deadline_at=parsed_deadline,
+            )
+        elif action == "task-reassign":
+            workflow.reassign_task(
+                task_id,
+                target_employee or "",
+                actor=actor,
+                actor_role=user["role"],
+                reason=change_reason or "",
+            )
+        elif action == "task-reopen":
+            workflow.reopen_cancelled_task(
+                task_id,
+                actor=actor,
+                actor_role=user["role"],
+                reason=change_reason or "",
+            )
         else:
             return no_update, no_update
         message = f"{task_id}: Aktion erfolgreich ausgeführt (Demo)."

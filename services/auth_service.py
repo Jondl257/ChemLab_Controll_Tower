@@ -30,6 +30,16 @@ def add_user(
     repo.add_local_user(username, password_hash, role, employee_id, created_by)
 
 
+def reset_password(
+    repo: Repository, username: str, password: str, actor: str
+) -> None:
+    if len(password) < 12:
+        raise ValueError("Das lokale Kennwort muss mindestens 12 Zeichen lang sein.")
+    repo.reset_local_user_password(
+        username, generate_password_hash(password), actor
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lokales ChemLab-Benutzerkonto anlegen.")
     parser.add_argument("--username", required=True)

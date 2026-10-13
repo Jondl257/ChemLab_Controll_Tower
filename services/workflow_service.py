@@ -7,7 +7,7 @@ import pandas as pd
 
 from config import deadline
 from data.master_data import PLANS
-from domain.enums import Role, TaskStatus
+from domain.enums import Role, TaskPriority, TaskStatus
 from domain.quality import assess
 from domain.workflow import validate_transition
 
@@ -226,6 +226,165 @@ class WorkflowService:
             self.repo.log_event(
                 "analysis_task", task_id, "status_changed", actor,
                 old_value=str(old_status), new_value=target,
+            )
+
+    def update_task_controls(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        actor_role: str,
+        reason: str,
+        priority: str | None = None,
+        deadline_at: datetime | str | None = None,
+    ) -> None:
+        if actor_role != Role.LABORLEITUNG.value:
+            raise ValueError("Nur die Laborleitung darf Priorität oder Frist ändern.")
+        if not (reason or "").strip():
+            raise ValueError("Für eine manuelle Änderung ist eine Begründung erforderlich.")
+        if priority is None and deadline_at is None:
+            raise ValueError("Bitte mindestens eine neue Priorität oder Frist angeben.")
+        if priority is not None and priority not in {
+            item.value for item in TaskPriority
+        } | {"Systemvorschlag"}:
+            raise ValueError("Bitte eine gültige Priorität auswählen.")
+        parsed_deadline = None
+        if deadline_at is not None:
+            try:
+                parsed_deadline = pd.Timestamp(deadline_at).to_pydatetime()
+            except (TypeError, ValueError):
+                raise ValueError("Bitte eine gültige Frist angeben.") from None
+            if pd.isna(parsed_deadline):
+                raise ValueError("Bitte eine gültige Frist angeben.")
+
+        with self.repo.transaction():
+            tasks = self.repo.table("tasks")
+            match = tasks.loc[tasks.task_id == task_id]
+            if len(match) != 1:
+                raise ValueError("Analyseauftrag nicht gefunden.")
+            row = match.iloc[0]
+            if row.status in (TaskStatus.RELEASED.value, TaskStatus.CANCELLED.value):
+                raise ValueError("Abgeschlossene oder abgebrochene Aufträge können nicht angepasst werden.")
+            idx = match.index[0]
+            if priority is not None:
+                previous = str(row.priority)
+                if priority == "Systemvorschlag":
+                    new_priority = row.system_priority
+                    tasks.at[idx, "manual_priority"] = None
+                    tasks.at[idx, "manual_priority_reason"] = None
+                else:
+                    new_priority = priority
+                    tasks.at[idx, "manual_priority"] = priority
+                    tasks.at[idx, "manual_priority_reason"] = reason.strip()
+                tasks.at[idx, "priority"] = new_priority
+                if previous != str(new_priority):
+                    self.repo.log_event(
+                        "analysis_task",
+                        task_id,
+                        "priority_changed",
+                        actor,
+                        old_value=previous,
+                        new_value=str(new_priority),
+                        reason=reason.strip(),
+                    )
+            if parsed_deadline is not None:
+                previous_deadline = pd.Timestamp(row.deadline).isoformat()
+                new_deadline = pd.Timestamp(parsed_deadline).isoformat()
+                tasks.at[idx, "deadline"] = parsed_deadline
+                tasks.at[idx, "manual_deadline_reason"] = reason.strip()
+                if previous_deadline != new_deadline:
+                    self.repo.log_event(
+                        "analysis_task",
+                        task_id,
+                        "deadline_changed",
+                        actor,
+                        old_value=previous_deadline,
+                        new_value=new_deadline,
+                        reason=reason.strip(),
+                    )
+            self.repo.replace("tasks", tasks)
+
+    def reassign_task(
+        self,
+        task_id: str,
+        employee_id: str,
+        *,
+        actor: str,
+        actor_role: str,
+        reason: str,
+    ) -> None:
+        if actor_role != Role.LABORLEITUNG.value:
+            raise ValueError("Nur die Laborleitung darf Aufträge neu zuweisen.")
+        if not (reason or "").strip():
+            raise ValueError("Für eine Neuzuweisung ist eine Begründung erforderlich.")
+        with self.repo.transaction():
+            tasks = self.repo.table("tasks")
+            match = tasks.loc[tasks.task_id == task_id]
+            if len(match) != 1:
+                raise ValueError("Analyseauftrag nicht gefunden.")
+            row = match.iloc[0]
+            if row.status not in (TaskStatus.CLAIMED.value, TaskStatus.IN_PROGRESS.value):
+                raise ValueError("Nur übernommene oder in Bearbeitung befindliche Aufträge können neu zugewiesen werden.")
+            employee = self.repo.table("employees")
+            staff = employee.loc[
+                (employee.employee_id == employee_id)
+                & (employee.role == Role.LABORANT.value)
+            ]
+            if len(staff) != 1:
+                raise ValueError("Die Neuzuweisung muss an einen gültigen Laboranten erfolgen.")
+            previous = row.assignee_id
+            if previous == employee_id:
+                raise ValueError("Der Auftrag ist diesem Laboranten bereits zugewiesen.")
+            tasks.at[match.index[0], "assignee_id"] = employee_id
+            self.repo.replace("tasks", tasks)
+            self.repo.log_event(
+                "analysis_task",
+                task_id,
+                "reassigned",
+                actor,
+                old_value=str(previous),
+                new_value=employee_id,
+                reason=reason.strip(),
+            )
+
+    def reopen_cancelled_task(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        actor_role: str,
+        reason: str,
+    ) -> None:
+        if actor_role != Role.LABORLEITUNG.value:
+            raise ValueError("Nur die Laborleitung darf einen Auftrag wiedereröffnen.")
+        if not (reason or "").strip():
+            raise ValueError("Für die Wiedereröffnung ist eine Begründung erforderlich.")
+        with self.repo.transaction():
+            tasks = self.repo.table("tasks")
+            match = tasks.loc[tasks.task_id == task_id]
+            if len(match) != 1:
+                raise ValueError("Analyseauftrag nicht gefunden.")
+            if match.iloc[0].status != TaskStatus.CANCELLED.value:
+                raise ValueError("Nur abgebrochene Aufträge können wiedereröffnet werden.")
+            results = self.repo.table("results")
+            current_results = results.loc[
+                (results.task_id == task_id) & results.is_current.astype(bool)
+            ]
+            if not current_results.empty:
+                raise ValueError("Aufträge mit maßgeblichem Ergebnis müssen fachlich geprüft werden und können nicht wiedereröffnet werden.")
+            idx = match.index[0]
+            tasks.at[idx, "status"] = TaskStatus.OPEN.value
+            tasks.at[idx, "assignee_id"] = None
+            tasks.at[idx, "completed_at"] = None
+            self.repo.replace("tasks", tasks)
+            self.repo.log_event(
+                "analysis_task",
+                task_id,
+                "reopened",
+                actor,
+                old_value=TaskStatus.CANCELLED.value,
+                new_value=TaskStatus.OPEN.value,
+                reason=reason.strip(),
             )
 
     def record_result(

@@ -7,7 +7,7 @@ from domain.quality import assess
 from domain.statistics import process_statistics
 from domain.workflow import validate_transition
 from services.workflow_service import WorkflowService
-from services.auth_service import add_user, authenticate
+from services.auth_service import add_user, authenticate, reset_password
 
 
 def test_generator_references_are_valid():
@@ -57,6 +57,144 @@ def test_reassignment_to_another_employee_is_blocked():
     workflow.transition(task.task_id, "Übernommen", "E-01", actor_role="Laborant", actor="lab")
     with pytest.raises(ValueError):
         workflow.transition(task.task_id, "Übernommen", "E-02", actor_role="Laborant", actor="other")
+
+
+def test_lead_can_audit_manual_priority_and_deadline_changes():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    task = repo.table("tasks").loc[
+        repo.table("tasks").status == "Offen"
+    ].iloc[0]
+    adjusted_deadline = datetime(2026, 10, 20, 16, 30)
+    workflow.update_task_controls(
+        task.task_id,
+        actor="lead",
+        actor_role="Laborleitung",
+        reason="Produktionsplanung priorisiert",
+        priority="Kritisch",
+        deadline_at=adjusted_deadline,
+    )
+    adjusted = repo.table("tasks").loc[
+        repo.table("tasks").task_id == task.task_id
+    ].iloc[0]
+    assert adjusted.priority == "Kritisch"
+    assert adjusted.manual_priority == "Kritisch"
+    assert adjusted.deadline == pd.Timestamp(adjusted_deadline)
+    events = repo.events(task.task_id)
+    assert [event["action"] for event in events][-2:] == [
+        "priority_changed", "deadline_changed"
+    ]
+    assert all(event["reason"] == "Produktionsplanung priorisiert" for event in events[-2:])
+
+    workflow.update_task_controls(
+        task.task_id,
+        actor="lead",
+        actor_role="Laborleitung",
+        reason="Manuelle Priorität nicht mehr erforderlich",
+        priority="Systemvorschlag",
+    )
+    restored = repo.table("tasks").loc[
+        repo.table("tasks").task_id == task.task_id
+    ].iloc[0]
+    assert restored.priority == restored.system_priority
+    assert pd.isna(restored.manual_priority)
+
+
+def test_priority_deadline_changes_require_lab_lead_and_reason():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    task_id = repo.table("tasks").loc[
+        repo.table("tasks").status == "Offen"
+    ].iloc[0].task_id
+    with pytest.raises(ValueError, match="Laborleitung"):
+        workflow.update_task_controls(
+            task_id,
+            actor="lab",
+            actor_role="Laborant",
+            reason="not allowed",
+            priority="Hoch",
+        )
+    with pytest.raises(ValueError, match="Begründung"):
+        workflow.update_task_controls(
+            task_id,
+            actor="lead",
+            actor_role="Laborleitung",
+            reason="",
+            priority="Hoch",
+        )
+
+
+def test_lead_can_reassign_claimed_task_with_reason():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    task = repo.table("tasks").loc[
+        repo.table("tasks").status == "Offen"
+    ].iloc[0]
+    workflow.transition(
+        task.task_id,
+        "Übernommen",
+        "E-01",
+        actor_role="Laborant",
+        actor="lab-one",
+    )
+    workflow.reassign_task(
+        task.task_id,
+        "E-02",
+        actor="lead",
+        actor_role="Laborleitung",
+        reason="Schichtübergabe",
+    )
+    reassigned = repo.table("tasks").loc[
+        repo.table("tasks").task_id == task.task_id
+    ].iloc[0]
+    assert reassigned.assignee_id == "E-02"
+    assert reassigned.status == "Übernommen"
+    assert repo.events(task.task_id)[-1]["reason"] == "Schichtübergabe"
+    with pytest.raises(ValueError, match="Begründung"):
+        workflow.reassign_task(
+            task.task_id,
+            "E-01",
+            actor="lead",
+            actor_role="Laborleitung",
+            reason="",
+        )
+
+
+def test_lead_can_reopen_cancelled_task_but_not_released_task():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    task = repo.table("tasks").loc[
+        repo.table("tasks").status == "Offen"
+    ].iloc[0]
+    workflow.transition(
+        task.task_id,
+        "Abgebrochen",
+        actor="lead",
+        actor_role="Laborleitung",
+    )
+    workflow.reopen_cancelled_task(
+        task.task_id,
+        actor="lead",
+        actor_role="Laborleitung",
+        reason="Abbruch irrtümlich erfolgt",
+    )
+    reopened = repo.table("tasks").loc[
+        repo.table("tasks").task_id == task.task_id
+    ].iloc[0]
+    assert reopened.status == "Offen"
+    assert pd.isna(reopened.assignee_id)
+    assert repo.events(task.task_id)[-1]["action"] == "reopened"
+
+    released_task = repo.table("tasks").loc[
+        repo.table("tasks").status == "Freigegeben"
+    ].iloc[0]
+    with pytest.raises(ValueError, match="Nur abgebrochene"):
+        workflow.reopen_cancelled_task(
+            released_task.task_id,
+            actor="lead",
+            actor_role="Laborleitung",
+            reason="Nicht zulässig",
+        )
 
 
 def test_sample_creation_is_multi_order_atomic_and_idempotent():
@@ -147,6 +285,31 @@ def test_local_accounts_use_password_hashes_and_database_roles():
     assert user is not None and user["password_hash"] != "secure-test-password"
     assert authenticate(repo, "chemist", "secure-test-password")["role"] == "Laborant"
     assert authenticate(repo, "chemist", "wrong-password") is None
+
+
+def test_admin_can_reset_password_and_deactivate_account_without_locking_out_admins():
+    repo = Repository(":memory:")
+    add_user(repo, "admin", "initial-admin-password", "Administrator", None)
+    add_user(repo, "backup-admin", "another-admin-password", "Administrator", None)
+    add_user(repo, "chemist", "initial-chemist-password", "Laborant", "E-01")
+
+    reset_password(repo, "chemist", "replacement-password", "admin")
+    assert authenticate(repo, "chemist", "initial-chemist-password") is None
+    assert authenticate(repo, "chemist", "replacement-password") is not None
+
+    repo.set_local_user_active("chemist", False, "admin")
+    assert authenticate(repo, "chemist", "replacement-password") is None
+    repo.set_local_user_active("chemist", True, "admin")
+    assert authenticate(repo, "chemist", "replacement-password") is not None
+
+    repo.set_local_user_active("admin", False, "backup-admin")
+    with pytest.raises(ValueError, match="letzte aktive Administratorkonto"):
+        repo.set_local_user_active("backup-admin", False, "backup-admin")
+    events = repo.events("chemist")
+    assert [event["action"] for event in events] == [
+        "created", "password_reset", "deactivated", "activated"
+    ]
+    assert all("replacement-password" not in str(event.values()) for event in events)
 
 
 def test_laborant_cannot_create_samples_or_release_results():
