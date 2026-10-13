@@ -336,3 +336,143 @@ def test_admin_page_renders_local_account_management_controls():
     content = str(response.get_json()["response"]["page"]["children"])
     assert "Kennwort zurücksetzen" in content
     assert "Konto deaktivieren" in content
+
+
+def test_sample_detail_callback_shows_order_and_result_history(isolated_logged_in_user):
+    sample_id = isolated_logged_in_user.table("samples").iloc[0].sample_id
+    output = next(
+        key for key in app.callback_map
+        if key.startswith("..sample-detail-content.children...")
+    )
+    response = callback_request(
+        output,
+        [
+            {"id": "sample-detail-content", "property": "children"},
+            {"id": "sample-edit-name", "property": "value"},
+            {"id": "sample-edit-batch", "property": "value"},
+            {"id": "sample-edit-notes", "property": "value"},
+        ],
+        [
+            {"id": "sample-detail-id", "property": "value", "value": sample_id},
+            {"id": "sample-detail-revision", "property": "data", "value": 0},
+        ],
+        changed="sample-detail-id.value",
+    )
+    assert response.status_code == 200
+    children = response.get_json()["response"]["sample-detail-content"]["children"]
+    assert children["type"] == "Div"
+    assert "Messungen und Ergebnisversionen" in str(children)
+
+
+def test_sample_update_callback_saves_only_for_lab_lead(isolated_logged_in_user):
+    local_repo = isolated_logged_in_user
+    sample_id = local_repo.table("samples").iloc[0].sample_id
+    output = next(
+        key for key in app.callback_map
+        if key.startswith("..sample-edit-message.children...")
+    )
+    response = callback_request(
+        output,
+        [
+            {"id": "sample-edit-message", "property": "children"},
+            {"id": "sample-detail-revision", "property": "data"},
+        ],
+        [{"id": "sample-edit-save", "property": "n_clicks", "value": 1}],
+        [
+            {"id": "sample-detail-id", "property": "value", "value": sample_id},
+            {"id": "sample-edit-name", "property": "value", "value": "Edited sample"},
+            {"id": "sample-edit-batch", "property": "value", "value": "B-EDITED"},
+            {"id": "sample-edit-notes", "property": "value", "value": "Updated in UI"},
+            {"id": "sample-edit-reason", "property": "value", "value": "Incoming record correction"},
+            {"id": "sample-detail-revision", "property": "data", "value": 0},
+        ],
+        "sample-edit-save.n_clicks",
+    )
+    assert response.status_code == 200
+    result = response.get_json()["response"]["sample-edit-message"]["children"]
+    assert result.startswith("Probendaten gespeichert")
+    saved = local_repo.table("samples").loc[
+        local_repo.table("samples").sample_id == sample_id
+    ].iloc[0]
+    assert saved.sample_name == "Edited sample"
+    with client.session_transaction() as user_session:
+        user_session["username"] = "lab"
+    denied = callback_request(
+        output,
+        [
+            {"id": "sample-edit-message", "property": "children"},
+            {"id": "sample-detail-revision", "property": "data"},
+        ],
+        [{"id": "sample-edit-save", "property": "n_clicks", "value": 2}],
+        [
+            {"id": "sample-detail-id", "property": "value", "value": sample_id},
+            {"id": "sample-edit-name", "property": "value", "value": "Must not persist"},
+            {"id": "sample-edit-batch", "property": "value", "value": "B"},
+            {"id": "sample-edit-notes", "property": "value", "value": "No"},
+            {"id": "sample-edit-reason", "property": "value", "value": "Reason"},
+            {"id": "sample-detail-revision", "property": "data", "value": 1},
+        ],
+        "sample-edit-save.n_clicks",
+    )
+    assert denied.status_code == 200
+    assert "Nur die Laborleitung" in denied.get_json()["response"]["sample-edit-message"]["children"]
+    assert local_repo.table("samples").loc[
+        local_repo.table("samples").sample_id == sample_id, "sample_name"
+    ].iloc[0] == "Edited sample"
+
+
+def test_oos_case_management_callback_opens_and_closes_case(isolated_logged_in_user):
+    local_repo = isolated_logged_in_user
+    result = local_repo.table("results").loc[
+        local_repo.table("results").quality_status == "OOS"
+    ].iloc[0]
+    output = next(
+        key for key in app.callback_map
+        if key.startswith("..oos-case-message.children...")
+    )
+    outputs = [
+        {"id": item.component_id, "property": item.component_property}
+        for item in app.callback_map[output]["output"]
+    ]
+    open_inputs = [
+        {"id": "oos-case-open", "property": "n_clicks", "value": 1},
+        {"id": "oos-case-close", "property": "n_clicks", "value": 0},
+    ]
+    state = [
+        {"id": "oos-result-id", "property": "value", "value": result.result_id},
+        {"id": "oos-initial-description", "property": "value", "value": "Demo investigation opened."},
+        {"id": "oos-case-list", "property": "selected_row_ids", "value": []},
+        {"id": "oos-root-cause", "property": "value", "value": None},
+        {"id": "oos-corrective-action", "property": "value", "value": None},
+        {"id": "oos-closure-rationale", "property": "value", "value": None},
+    ]
+    opened = callback_request(
+        output, outputs, open_inputs, state, "oos-case-open.n_clicks"
+    )
+    assert opened.status_code == 200
+    opened_payload = opened.get_json()["response"]
+    case_id = opened_payload["oos-case-list"]["data"][0]["case_id"]
+    assert opened_payload["oos-case-message"]["children"] == f"OOS-Fall {case_id} eröffnet."
+
+    close_inputs = [
+        {"id": "oos-case-open", "property": "n_clicks", "value": 1},
+        {"id": "oos-case-close", "property": "n_clicks", "value": 1},
+    ]
+    close_state = [
+        {"id": "oos-result-id", "property": "value", "value": result.result_id},
+        {"id": "oos-initial-description", "property": "value", "value": "Demo investigation opened."},
+        {"id": "oos-case-list", "property": "selected_row_ids", "value": [case_id]},
+        {"id": "oos-root-cause", "property": "value", "value": "Demo root cause."},
+        {"id": "oos-corrective-action", "property": "value", "value": "Containment recorded."},
+        {"id": "oos-closure-rationale", "property": "value", "value": "Demo investigation completed."},
+    ]
+    closed = callback_request(
+        output, outputs, close_inputs, close_state, "oos-case-close.n_clicks"
+    )
+    assert closed.status_code == 200
+    closed_payload = closed.get_json()["response"]
+    assert "der Ergebnisstatus bleibt OOS" in closed_payload["oos-case-message"]["children"]
+    assert closed_payload["oos-case-list"]["data"][0]["status"] == "Abgeschlossen"
+    assert local_repo.table("results").loc[
+        local_repo.table("results").result_id == result.result_id, "quality_status"
+    ].iloc[0] == "OOS"

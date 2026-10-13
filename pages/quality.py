@@ -4,12 +4,44 @@ import plotly.express as px
 from components.ui import kpi
 from config import COLORS
 from domain.enums import TaskStatus
-from services.analytics_service import result_view
+from services.analytics_service import result_view, sample_quality_view
+
+
+OOS_CASE_COLUMNS = [
+    "case_id", "status", "result_id", "sample_id", "task_id",
+    "result_version", "opened_at", "opened_by", "initial_description",
+    "root_cause", "corrective_action", "closure_rationale",
+    "closed_at", "closed_by",
+]
+OOS_CASE_LABELS = [
+    "Fall", "Status", "Ergebnis", "Probe", "Auftrag", "Version",
+    "Eröffnet", "Eröffnet von", "Erstbeschreibung", "Ursache",
+    "Maßnahme", "Abschlussbegründung", "Abgeschlossen", "Abgeschlossen von",
+]
+
+
+def oos_case_records(repo):
+    records = repo.table("oos_cases")[OOS_CASE_COLUMNS].fillna("").astype(str).to_dict("records")
+    for row in records:
+        row["id"] = row["case_id"]
+    return records
 
 
 def layout(repo):
     results = result_view(repo)
+    sample_quality = sample_quality_view(repo)
     current = results.loc[results.is_current.astype(bool)].copy()
+    oos_results = results.loc[results.quality_status.eq("OOS")].copy()
+    oos_result_options = [
+        {
+            "label": (
+                f"{row.result_id} · {row.sample_id} · {row.task_id} · "
+                f"{row.parameter}: {row.value} {row.unit} · Version {row.result_version}"
+            ),
+            "value": row.result_id,
+        }
+        for row in oos_results.itertuples()
+    ]
     counts = current.quality_status.value_counts()
     total = len(current)
     oos = int(counts.get("OOS", 0))
@@ -70,6 +102,73 @@ def layout(repo):
         ], className="action-row"),
         html.H3("Prüfung erforderlich"),
         review_table,
+        html.H3("Automatische Probenbewertung (Demo; keine Produktfreigabe)"),
+        html.P(
+            "OOS-Ergebnisse werden unabhängig vom Freigabestatus als untersuchungsbedürftig "
+            "markiert. Konformität wird nur angezeigt, wenn alle beauftragten Analysen "
+            "freigegeben und gültig sind und keine ausgelassene Pflichtanalyse protokolliert ist.",
+            className="note",
+        ),
+        dash_table.DataTable(
+            sample_quality.to_dict("records"),
+            [{"name": label, "id": column} for column, label in (
+                ("sample_id", "Probe"),
+                ("product", "Produkt"),
+                ("sample_type", "Probenart"),
+                ("batch_id", "Charge"),
+                ("analysis_count", "Aufträge"),
+                ("required_count", "Pflichtaufträge"),
+                ("released_count", "Freigegeben"),
+                ("oos_count", "OOS-Werte"),
+                ("oos_open_case_count", "Untersuchung offen/fehlend"),
+                ("oos_closed_case_count", "Untersuchung abgeschlossen"),
+                ("assessment", "Automatische Bewertung (Demo)"),
+            )],
+            id="qc-sample-assessment",
+            page_size=12,
+            sort_action="native",
+            filter_action="native",
+            style_table={"overflowX": "auto"},
+        ),
+        html.H3("OOS-Untersuchungsfälle (Demo)"),
+        html.P(
+            "Fallabschluss dokumentiert Ursache, Maßnahme und Begründung. Er ändert weder "
+            "den OOS-Status des Messwerts noch gibt Probe oder Charge frei.",
+            className="note",
+        ),
+        html.Div([
+            dcc.Dropdown(
+                oos_result_options,
+                id="oos-result-id",
+                placeholder="OOS-Ergebnisversion auswählen",
+                clearable=True,
+            ),
+            dcc.Textarea(
+                id="oos-initial-description",
+                placeholder="Erstbeschreibung / unmittelbare Eindämmung (erforderlich)",
+            ),
+            html.Button("OOS-Fall eröffnen", id="oos-case-open", className="primary"),
+        ], className="sample-form"),
+        dash_table.DataTable(
+            oos_case_records(repo),
+            [
+                {"name": label, "id": column}
+                for label, column in zip(OOS_CASE_LABELS, OOS_CASE_COLUMNS)
+            ],
+            id="oos-case-list",
+            row_selectable="single",
+            page_size=8,
+            sort_action="native",
+            filter_action="native",
+            style_table={"overflowX": "auto"},
+        ),
+        html.Div([
+            dcc.Textarea(id="oos-root-cause", placeholder="Ursachenbewertung (erforderlich)"),
+            dcc.Textarea(id="oos-corrective-action", placeholder="Korrektur-/Vorbeugemaßnahme (erforderlich)"),
+            dcc.Textarea(id="oos-closure-rationale", placeholder="Begründung für den Fallabschluss (erforderlich)"),
+            html.Button("OOS-Fall dokumentiert abschließen", id="oos-case-close", className="secondary"),
+            html.Div(id="oos-case-message", className="message"),
+        ], className="sample-form"),
         html.Div([
             kpi("Maßgebliche Ergebnisse", str(total)),
             kpi("PASS", str(int(counts.get("PASS", 0)))),

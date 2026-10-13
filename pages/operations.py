@@ -1,11 +1,12 @@
 from uuid import uuid4
 
 from dash import dcc, html, dash_table
+import pandas as pd
 import plotly.express as px
 
 from components.ui import kpi
 from data.master_data import PLANS
-from services.analytics_service import task_view, queue_records, queue_masks
+from services.analytics_service import result_view, task_view, queue_records, queue_masks
 from services.workflow_service import SAMPLE_TYPES
 
 QUEUE_COLUMNS = [
@@ -132,7 +133,93 @@ def local_user_records(repo):
     ]
 
 
-def layout(repo, is_admin=False):
+def sample_options(repo):
+    samples = repo.table("samples").merge(
+        repo.table("products")[["product_id", "product"]],
+        on="product_id",
+    )
+    return [
+        {
+            "label": (
+                f"{row.sample_id} · {row.product} · {row.sample_type}"
+                f"{f' · {row.batch_id}' if pd.notna(row.batch_id) and row.batch_id else ''}"
+            ),
+            "value": row.sample_id,
+        }
+        for row in samples.itertuples()
+    ]
+
+
+def sample_detail_content(repo, sample_id):
+    samples = repo.table("samples")
+    selected = samples.loc[samples.sample_id == sample_id]
+    if len(selected) != 1:
+        return html.P("Probe nicht gefunden.")
+    sample = selected.iloc[0]
+    tasks = task_view(repo)
+    tasks = tasks.loc[tasks.sample_id == sample_id]
+    task_columns = ["task_id", "method", "status", "priority", "deadline", "employee"]
+    task_labels = ["Auftrag", "Methode", "Status", "Priorität", "Fälligkeit", "Bearbeiter"]
+    task_records = tasks[task_columns].fillna("").astype(str).to_dict("records")
+    task_table = dash_table.DataTable(
+        task_records,
+        [{"name": label, "id": column} for label, column in zip(task_labels, task_columns)],
+        page_size=8,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+    )
+
+    results = result_view(repo)
+    results = results.loc[results.sample_id == sample_id].sort_values(
+        ["task_id", "result_version"]
+    )
+    result_columns = [
+        "task_id", "parameter", "value", "unit", "quality_status",
+        "result_version", "is_current", "review_status", "measured_at",
+        "released_at", "recorded_by", "released_by", "comment",
+    ]
+    result_labels = [
+        "Auftrag", "Parameter", "Messwert", "Einheit", "QC-Status",
+        "Version", "Maßgeblich", "Prüfstatus", "Gemessen", "Freigegeben",
+        "Erfasst von", "Freigegeben von", "Kommentar",
+    ]
+    result_table = dash_table.DataTable(
+        results[result_columns].fillna("").astype(str).to_dict("records"),
+        [{"name": label, "id": column} for label, column in zip(result_labels, result_columns)],
+        page_size=10,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+    )
+
+    events = repo.events(sample_id)
+    for task_id in tasks.task_id:
+        events.extend(repo.events(task_id))
+    events.sort(key=lambda event: (event["occurred_at"], event["event_id"]))
+    event_columns = ["occurred_at", "entity_type", "entity_id", "action", "actor", "old_value", "new_value", "reason"]
+    event_labels = ["Zeitpunkt", "Typ", "ID", "Aktion", "Akteur", "Vorher", "Nachher", "Begründung"]
+    event_table = dash_table.DataTable(
+        [{column: str(event.get(column) or "") for column in event_columns} for event in events],
+        [{"name": label, "id": column} for label, column in zip(event_labels, event_columns)],
+        page_size=10,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+    )
+    product = repo.table("products").set_index("product_id").loc[sample.product_id, "product"]
+    return html.Div([
+        html.P(
+            f"Probe {sample.sample_id} · {product} · {sample.sample_type} · "
+            f"Eingang: {sample.received_at} · Angelegt von: {sample.created_by}"
+        ),
+        html.H4("Analyseaufträge"),
+        task_table,
+        html.H4("Messungen und Ergebnisversionen"),
+        result_table,
+        html.H4("Änderungs- und Workflowhistorie"),
+        event_table,
+    ])
+
+
+def layout(repo, is_admin=False, can_edit_samples=False):
     tasks = task_view(repo)
     masks = queue_masks(tasks)
     active = masks["active"]
@@ -218,6 +305,7 @@ def layout(repo, is_admin=False):
         html.Div(id="workflow-message", className="message"),
     ])
     admin_panel = []
+    available_samples = sample_options(repo)
     if is_admin:
         employees = repo.table("employees")
         admin_panel = [html.Details([
@@ -290,5 +378,35 @@ def layout(repo, is_admin=False):
         table,
         controls,
         _sample_form(repo),
+        html.Details([
+            html.Summary("Probe ansehen und Probendaten bearbeiten"),
+            dcc.Dropdown(
+                available_samples,
+                available_samples[-1]["value"] if available_samples else None,
+                id="sample-detail-id",
+                placeholder="Probe auswählen",
+                clearable=False,
+            ),
+            html.Div(id="sample-detail-content"),
+            html.H4("Stammdaten ändern"),
+            html.Div([
+                dcc.Input(id="sample-edit-name", type="text", placeholder="Probenbezeichnung", disabled=not can_edit_samples),
+                dcc.Input(id="sample-edit-batch", type="text", placeholder="Charge", disabled=not can_edit_samples),
+                dcc.Textarea(id="sample-edit-notes", placeholder="Notiz", disabled=not can_edit_samples),
+                dcc.Textarea(
+                    id="sample-edit-reason",
+                    placeholder="Begründung (erforderlich)",
+                    disabled=not can_edit_samples,
+                ),
+                html.Button(
+                    "Probendaten speichern",
+                    id="sample-edit-save",
+                    className="primary",
+                    disabled=not can_edit_samples,
+                ),
+            ], className="sample-form"),
+            html.Div(id="sample-edit-message", className="message"),
+            dcc.Store(id="sample-detail-revision", data=0),
+        ]),
         *admin_panel,
     ])

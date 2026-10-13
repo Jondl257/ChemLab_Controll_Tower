@@ -11,6 +11,7 @@ import secrets
 
 from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 from flask import session
+import pandas as pd
 from data.repository import Repository
 from data.master_data import PLANS
 from pages import operations, quality, statistics
@@ -18,6 +19,7 @@ from config import APP_TITLE
 from services.auth_service import authenticate
 from services.workflow_service import WorkflowService
 from domain.enums import TaskStatus
+from services.analytics_service import sample_quality_view
 
 repo = Repository()
 app = Dash(__name__, title=APP_TITLE, suppress_callback_exceptions=True)
@@ -120,8 +122,74 @@ def page(tab, auth_revision):
     if user is None:
         return html.P("Bitte zuerst lokal anmelden.")
     if tab == "operations":
-        return operations.layout(repo, is_admin=user["role"] == "Administrator")
+        return operations.layout(
+            repo,
+            is_admin=user["role"] == "Administrator",
+            can_edit_samples=user["role"] == "Laborleitung",
+        )
     return {"quality": quality.layout, "statistics": statistics.layout}[tab](repo)
+
+
+@app.callback(
+    Output("sample-detail-content", "children"),
+    Output("sample-edit-name", "value"),
+    Output("sample-edit-batch", "value"),
+    Output("sample-edit-notes", "value"),
+    Input("sample-detail-id", "value"),
+    Input("sample-detail-revision", "data"),
+)
+def sample_detail(sample_id, revision):
+    _ = revision
+    if current_user() is None:
+        return html.P("Bitte zuerst lokal anmelden."), None, None, None
+    if not sample_id:
+        return html.P("Keine Probe ausgewählt."), None, None, None
+    sample = repo.table("samples")
+    selected = sample.loc[sample.sample_id == sample_id]
+    if len(selected) != 1:
+        return html.P("Probe nicht gefunden."), None, None, None
+    row = selected.iloc[0]
+    return (
+        operations.sample_detail_content(repo, sample_id),
+        row.sample_name if pd.notna(row.sample_name) else "",
+        row.batch_id if pd.notna(row.batch_id) else "",
+        row.notes if pd.notna(row.notes) else "",
+    )
+
+
+@app.callback(
+    Output("sample-edit-message", "children"),
+    Output("sample-detail-revision", "data"),
+    Input("sample-edit-save", "n_clicks"),
+    State("sample-detail-id", "value"),
+    State("sample-edit-name", "value"),
+    State("sample-edit-batch", "value"),
+    State("sample-edit-notes", "value"),
+    State("sample-edit-reason", "value"),
+    State("sample-detail-revision", "data"),
+    prevent_initial_call=True,
+)
+def update_sample_details(
+    clicks, sample_id, sample_name, batch_id, notes, reason, revision
+):
+    if not clicks:
+        return no_update, no_update
+    user = current_user()
+    if user is None:
+        return "Bitte zuerst lokal anmelden.", no_update
+    try:
+        workflow.update_sample_details(
+            sample_id or "",
+            sample_name=sample_name,
+            batch_id=batch_id,
+            notes=notes,
+            reason=reason or "",
+            actor=user["username"],
+            actor_role=user["role"],
+        )
+        return "Probendaten gespeichert; Änderung und Begründung wurden protokolliert.", (revision or 0) + 1
+    except ValueError as exc:
+        return f"Keine Änderung: {exc}", no_update
 
 
 @app.callback(
@@ -511,6 +579,75 @@ def release_quality_result(clicks, selected_ids, revision):
         return f"{selected_ids[0]}: Ergebnisversion fachlich freigegeben (Demo).", (revision or 0) + 1
     except ValueError as exc:
         return f"Keine Änderung: {exc}", (revision or 0) + 1
+
+
+@app.callback(
+    Output("oos-case-message", "children"),
+    Output("oos-case-list", "data"),
+    Output("qc-sample-assessment", "data"),
+    Input("oos-case-open", "n_clicks"),
+    Input("oos-case-close", "n_clicks"),
+    State("oos-result-id", "value"),
+    State("oos-initial-description", "value"),
+    State("oos-case-list", "selected_row_ids"),
+    State("oos-root-cause", "value"),
+    State("oos-corrective-action", "value"),
+    State("oos-closure-rationale", "value"),
+    prevent_initial_call=True,
+)
+def manage_oos_case(
+    open_clicks,
+    close_clicks,
+    result_id,
+    initial_description,
+    selected_case_ids,
+    root_cause,
+    corrective_action,
+    closure_rationale,
+):
+    action = ctx.triggered_id
+    if action == "oos-case-open" and not open_clicks:
+        return no_update, no_update, no_update
+    if action == "oos-case-close" and not close_clicks:
+        return no_update, no_update, no_update
+    user = current_user()
+    if user is None:
+        return "Bitte zuerst lokal anmelden.", no_update, no_update
+    if user["role"] != "Laborleitung":
+        return "Keine Änderung: Nur die Laborleitung darf OOS-Fälle verwalten.", no_update, no_update
+    try:
+        if action == "oos-case-open":
+            case_id = workflow.open_oos_case(
+                result_id or "",
+                initial_description or "",
+                actor=user["username"],
+                actor_role=user["role"],
+            )
+            message = f"OOS-Fall {case_id} eröffnet."
+        elif action == "oos-case-close":
+            if len(selected_case_ids or []) != 1:
+                raise ValueError("Bitte genau einen OOS-Fall auswählen.")
+            workflow.close_oos_case(
+                selected_case_ids[0],
+                root_cause=root_cause or "",
+                corrective_action=corrective_action or "",
+                closure_rationale=closure_rationale or "",
+                actor=user["username"],
+                actor_role=user["role"],
+            )
+            message = (
+                f"OOS-Fall {selected_case_ids[0]} abgeschlossen; "
+                "der Ergebnisstatus bleibt OOS."
+            )
+        else:
+            return no_update, no_update, no_update
+        return (
+            message,
+            quality.oos_case_records(repo),
+            sample_quality_view(repo).to_dict("records"),
+        )
+    except ValueError as exc:
+        return f"Keine Änderung: {exc}", no_update, no_update
 
 
 if __name__ == "__main__":

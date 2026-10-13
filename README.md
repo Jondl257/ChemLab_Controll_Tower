@@ -53,13 +53,16 @@ Alternativ können Administratoren in der Operations-Ansicht weitere lokale Kont
 - Persistente Queue, Suche, Frist-/Prioritäts-KPIs, Workflow-Aktionen und Rollenprüfung.
 - Lokale Administrationsfunktionen zum Anlegen, Aktivieren/Deaktivieren und Zurücksetzen von Benutzerkonten; Schutz vor Deaktivierung des letzten aktiven Administrators.
 - Beaufsichtigte Prioritäts-/Friständerung, Neuzuweisung und Wiedereröffnung abgebrochener Aufträge durch die Laborleitung mit verpflichtender Begründung und Audit-Ereignis.
+- Proben-Detailansicht mit Analyseauftrags-, Messwertversions- und Audit-Historie; Bezeichnung, Charge und Notiz können durch die Laborleitung begründet geändert werden.
+- Automatische Probenbewertung im QC-Tab kennzeichnet OOS, Grenznähe, unvollständige Ergebnisse und ausgelassene Pflichtanalysen. Ein Demo-Konformitätsstatus ist ausdrücklich keine Proben- oder Chargenfreigabe.
+- Begründete OOS-Fälle können pro Ergebnisversion eröffnet und von der Laborleitung mit Ursache, Maßnahme und Abschlussbegründung abgeschlossen werden. Der Abschluss verändert den OOS-Status des Ergebnisses nicht.
 - Versionierte Messwerte mit Grenzwertstatus, Ergebnisprüfung/Freigabe und sichtbarer Historie.
 - Statistik über aktuelle freigegebene Ergebnisse, unter anderem gefiltert nach Produkt, Methode, Probenart, Parameter, Qualität und Zeitraum.
 - Audit-Ereignisse für wesentliche Anlage-, Mess- und Statusänderungen.
 
 ## Noch nicht vollständig umgesetzt
 
-Die Anwendung ist weiterhin ein Demonstrator und erfüllt noch nicht den vollständigen ursprünglichen Anforderungskatalog. Unter anderem fehlen eine vollständige Prüfplan-/Spezifikationsversionierung und Übernahme je Probe, Probe-Detailansicht mit allgemeinen Stammdaten-Änderungsfunktionen sowie eine vollständige OOS-Fallbewertung und die Qualitätsentscheidung auf Probenebene. Freigegebene Aufträge können bewusst nicht wiedereröffnet werden; nur abgebrochene Aufträge ohne maßgebliches Ergebnis sind für die begründete Wiedereröffnung zugelassen. Prüfplanregeln und weitere fachliche Vorgaben sind teilweise nur als Demo-Defaults umgesetzt.
+Die Anwendung ist weiterhin ein Demonstrator und erfüllt noch nicht den vollständigen ursprünglichen Anforderungskatalog. Unter anderem fehlen eine vollständige Prüfplan-/Spezifikationsversionierung und Übernahme je Probe sowie weitergehende Stammdatenänderungen (zum Beispiel Produkt und Probenart). Der OOS-Fallworkflow ist ein minimales Demo-Register; formale Untersuchungsplanung, Beweis-/Dokumentenanhänge, CAPA-Verknüpfung und unabhängig kontrollierte Abschlussfreigabe sind nicht implementiert. Die automatische Probenbewertung ist nur ein Demo-Hinweis, keine formelle Qualitätsentscheidung. Freigegebene Aufträge können bewusst nicht wiedereröffnet werden; nur abgebrochene Aufträge ohne maßgebliches Ergebnis sind für die begründete Wiedereröffnung zugelassen. Prüfplanregeln und weitere fachliche Vorgaben sind teilweise nur als Demo-Defaults umgesetzt.
 
 Ergebnisfreigabe bezieht sich ausschließlich auf eine einzelne Demo-Ergebnisversion und ist **keine** Chargen-, Produkt- oder Produktionsfreigabe. Cp/Cpk und Kontrollgrenzen werden bei unzureichender bzw. nicht homogener Datenbasis ausgeblendet; diese Demo-Heuristik ist keine validierte Statistikregel.
 

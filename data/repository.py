@@ -15,6 +15,7 @@ DATETIME_COLUMNS = {
     "samples": ("received_at", "created_at"),
     "tasks": ("received_at", "deadline", "completed_at", "ordered_at"),
     "results": ("measured_at", "released_at"),
+    "oos_cases": ("opened_at", "closed_at"),
 }
 
 
@@ -47,6 +48,16 @@ class Repository:
             "(username TEXT PRIMARY KEY COLLATE NOCASE, password_hash TEXT NOT NULL, "
             "role TEXT NOT NULL, employee_id TEXT, active INTEGER NOT NULL DEFAULT 1, "
             "created_at TEXT NOT NULL, created_by TEXT NOT NULL)"
+        )
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS oos_cases ("
+            "case_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, "
+            "task_id TEXT NOT NULL, sample_id TEXT NOT NULL, "
+            "result_version INTEGER NOT NULL, status TEXT NOT NULL, "
+            "opened_at TEXT NOT NULL, opened_by TEXT NOT NULL, "
+            "initial_description TEXT NOT NULL, root_cause TEXT, "
+            "corrective_action TEXT, closure_rationale TEXT, "
+            "closed_at TEXT, closed_by TEXT)"
         )
         self._connection.commit()
         initialized = self._connection.execute(

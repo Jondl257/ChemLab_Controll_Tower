@@ -163,6 +163,62 @@ class WorkflowService:
             self.repo.save_submission(key, sample_id, task_ids)
         return sample_id, task_ids
 
+    def update_sample_details(
+        self,
+        sample_id: str,
+        *,
+        sample_name: str | None,
+        batch_id: str | None,
+        notes: str | None,
+        reason: str,
+        actor: str,
+        actor_role: str,
+    ) -> None:
+        if actor_role != Role.LABORLEITUNG.value:
+            raise ValueError("Nur die Laborleitung darf Probendaten ändern.")
+        normalized_reason = (reason or "").strip()
+        if not normalized_reason:
+            raise ValueError("Für eine Änderung an der Probe ist eine Begründung erforderlich.")
+        values = {
+            "sample_name": (sample_name or "").strip() or None,
+            "batch_id": (batch_id or "").strip() or None,
+            "notes": (notes or "").strip() or None,
+        }
+        limits = {"sample_name": 200, "batch_id": 100, "notes": 2000}
+        for field, value in values.items():
+            if value is not None and len(value) > limits[field]:
+                raise ValueError(
+                    f"Das Feld {field} darf höchstens {limits[field]} Zeichen enthalten."
+                )
+
+        with self.repo.transaction():
+            samples = self.repo.table("samples")
+            match = samples.loc[samples.sample_id == sample_id]
+            if len(match) != 1:
+                raise ValueError("Probe nicht gefunden.")
+            idx = match.index[0]
+            row = match.iloc[0]
+            changes = []
+            for field, new_value in values.items():
+                previous_value = row[field]
+                old_value = None if pd.isna(previous_value) else str(previous_value)
+                if old_value != new_value:
+                    samples.at[idx, field] = new_value
+                    changes.append((field, old_value, new_value))
+            if not changes:
+                raise ValueError("Es wurden keine Probendaten geändert.")
+            self.repo.replace("samples", samples)
+            for field, old_value, new_value in changes:
+                self.repo.log_event(
+                    "sample",
+                    sample_id,
+                    f"{field}_changed",
+                    actor,
+                    old_value=old_value,
+                    new_value=new_value,
+                    reason=normalized_reason,
+                )
+
     def transition(
         self,
         task_id: str,
@@ -270,14 +326,20 @@ class WorkflowService:
                 previous = str(row.priority)
                 if priority == "Systemvorschlag":
                     new_priority = row.system_priority
+                    manual_changed = pd.notna(row.manual_priority)
                     tasks.at[idx, "manual_priority"] = None
                     tasks.at[idx, "manual_priority_reason"] = None
                 else:
                     new_priority = priority
+                    manual_changed = (
+                        pd.isna(row.manual_priority)
+                        or row.manual_priority != priority
+                        or row.manual_priority_reason != reason.strip()
+                    )
                     tasks.at[idx, "manual_priority"] = priority
                     tasks.at[idx, "manual_priority_reason"] = reason.strip()
                 tasks.at[idx, "priority"] = new_priority
-                if previous != str(new_priority):
+                if previous != str(new_priority) or manual_changed:
                     self.repo.log_event(
                         "analysis_task",
                         task_id,
@@ -292,7 +354,11 @@ class WorkflowService:
                 new_deadline = pd.Timestamp(parsed_deadline).isoformat()
                 tasks.at[idx, "deadline"] = parsed_deadline
                 tasks.at[idx, "manual_deadline_reason"] = reason.strip()
-                if previous_deadline != new_deadline:
+                reason_changed = (
+                    pd.isna(row.manual_deadline_reason)
+                    or row.manual_deadline_reason != reason.strip()
+                )
+                if previous_deadline != new_deadline or reason_changed:
                     self.repo.log_event(
                         "analysis_task",
                         task_id,
@@ -385,6 +451,113 @@ class WorkflowService:
                 old_value=TaskStatus.CANCELLED.value,
                 new_value=TaskStatus.OPEN.value,
                 reason=reason.strip(),
+            )
+
+    def open_oos_case(
+        self,
+        result_id: str,
+        description: str,
+        *,
+        actor: str,
+        actor_role: str,
+    ) -> str:
+        if actor_role != Role.LABORLEITUNG.value:
+            raise ValueError("Nur die Laborleitung darf eine OOS-Untersuchung eröffnen.")
+        normalized_description = (description or "").strip()
+        if not normalized_description:
+            raise ValueError("Für die OOS-Untersuchung ist eine Erstbeschreibung erforderlich.")
+        if len(normalized_description) > 4000:
+            raise ValueError("Die Erstbeschreibung darf höchstens 4000 Zeichen enthalten.")
+        with self.repo.transaction():
+            results = self.repo.table("results")
+            match = results.loc[results.result_id == result_id]
+            if len(match) != 1:
+                raise ValueError("Ergebnisversion nicht gefunden.")
+            result = match.iloc[0]
+            if result.quality_status != "OOS":
+                raise ValueError("Eine OOS-Untersuchung kann nur für ein OOS-Ergebnis eröffnet werden.")
+            cases = self.repo.table("oos_cases")
+            if cases.result_id.eq(result_id).any():
+                raise ValueError("Für diese Ergebnisversion existiert bereits ein OOS-Fall.")
+            case_id = _next_id(cases, "case_id", "OOS-", 5)
+            case = {
+                "case_id": case_id,
+                "result_id": result_id,
+                "task_id": result.task_id,
+                "sample_id": self.repo.table("tasks").set_index("task_id").loc[result.task_id, "sample_id"],
+                "result_version": int(result.result_version),
+                "status": "Offen",
+                "opened_at": datetime.now(),
+                "opened_by": actor,
+                "initial_description": normalized_description,
+                "root_cause": None,
+                "corrective_action": None,
+                "closure_rationale": None,
+                "closed_at": None,
+                "closed_by": None,
+            }
+            cases = pd.concat([cases, pd.DataFrame([case])], ignore_index=True)
+            self.repo.replace("oos_cases", cases)
+            self.repo.log_event(
+                "oos_case",
+                case_id,
+                "opened",
+                actor,
+                new_value=f"result={result_id}; task={result.task_id}",
+                reason=normalized_description,
+            )
+        return case_id
+
+    def close_oos_case(
+        self,
+        case_id: str,
+        *,
+        root_cause: str,
+        corrective_action: str,
+        closure_rationale: str,
+        actor: str,
+        actor_role: str,
+    ) -> None:
+        if actor_role != Role.LABORLEITUNG.value:
+            raise ValueError("Nur die Laborleitung darf eine OOS-Untersuchung abschließen.")
+        values = {
+            "root_cause": (root_cause or "").strip(),
+            "corrective_action": (corrective_action or "").strip(),
+            "closure_rationale": (closure_rationale or "").strip(),
+        }
+        labels = {
+            "root_cause": "Ursachenbewertung",
+            "corrective_action": "Maßnahme",
+            "closure_rationale": "Abschlussbegründung",
+        }
+        for field, value in values.items():
+            if not value:
+                raise ValueError(f"{labels[field]} muss ausgefüllt werden.")
+            if len(value) > 4000:
+                raise ValueError(f"{labels[field]} darf höchstens 4000 Zeichen enthalten.")
+        with self.repo.transaction():
+            cases = self.repo.table("oos_cases")
+            match = cases.loc[cases.case_id == case_id]
+            if len(match) != 1:
+                raise ValueError("OOS-Fall nicht gefunden.")
+            row = match.iloc[0]
+            if row.status != "Offen":
+                raise ValueError("Nur offene OOS-Fälle können abgeschlossen werden.")
+            idx = match.index[0]
+            for field, value in values.items():
+                cases.at[idx, field] = value
+            cases.at[idx, "status"] = "Abgeschlossen"
+            cases.at[idx, "closed_at"] = datetime.now()
+            cases.at[idx, "closed_by"] = actor
+            self.repo.replace("oos_cases", cases)
+            self.repo.log_event(
+                "oos_case",
+                case_id,
+                "closed",
+                actor,
+                old_value="Offen",
+                new_value="Abgeschlossen; OOS-Ergebnis bleibt unverändert",
+                reason=values["closure_rationale"],
             )
 
     def record_result(

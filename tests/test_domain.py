@@ -6,6 +6,7 @@ from data.repository import Repository
 from domain.quality import assess
 from domain.statistics import process_statistics
 from domain.workflow import validate_transition
+from services.analytics_service import sample_quality_view
 from services.workflow_service import WorkflowService
 from services.auth_service import add_user, authenticate, reset_password
 
@@ -25,6 +26,169 @@ def test_oos_logic():
 def test_statistics_known_values():
     s = process_statistics(pd.Series([1.0, 2.0, 3.0]), 0.0, 4.0)
     assert s["mean"] == 2 and s["cp"] is not None
+
+
+def test_sample_quality_view_distinguishes_pass_oos_pending_near_limit_and_omissions():
+    repo = Repository(":memory:")
+    sample = repo.table("samples").iloc[[0]].copy()
+    task = repo.table("tasks").loc[
+        repo.table("tasks").sample_id == sample.iloc[0].sample_id
+    ].iloc[[0]].copy()
+    result = repo.table("results").loc[
+        repo.table("results").task_id == task.iloc[0].task_id
+    ].iloc[[0]].copy()
+    task["status"] = "Freigegeben"
+    task["is_required"] = 1
+    result["is_current"] = 1
+    result["quality_status"] = "PASS"
+    result["validity_status"] = "gültig"
+    result["review_status"] = "freigegeben"
+    repo.replace("samples", sample)
+    repo.replace("tasks", task)
+    repo.replace("results", result)
+
+    assessment = sample_quality_view(repo).iloc[0]
+    assert assessment.assessment == "Konform (Demo; keine Freigabe)"
+
+    result["quality_status"] = "OOS"
+    task["status"] = "Prüfung erforderlich"
+    result["review_status"] = "Prüfung erforderlich"
+    repo.replace("tasks", task)
+    repo.replace("results", result)
+    assert sample_quality_view(repo).iloc[0].assessment == "OOS – Untersuchung erforderlich"
+
+    result["quality_status"] = "PASS"
+    task["status"] = "In Bearbeitung"
+    result["review_status"] = "Prüfung erforderlich"
+    repo.replace("tasks", task)
+    repo.replace("results", result)
+    assert sample_quality_view(repo).iloc[0].assessment == "Nicht abschließend bewertbar"
+
+    task["status"] = "Freigegeben"
+    result["quality_status"] = "GRENZNAH"
+    result["review_status"] = "freigegeben"
+    repo.replace("tasks", task)
+    repo.replace("results", result)
+    assert sample_quality_view(repo).iloc[0].assessment == "Grenznah – fachliche Bewertung erforderlich"
+
+    repo.log_event(
+        "sample",
+        sample.iloc[0].sample_id,
+        "required_analyses_omitted",
+        "lead",
+        reason="Demo-Ausnahme",
+    )
+    result["quality_status"] = "PASS"
+    repo.replace("results", result)
+    assert sample_quality_view(repo).iloc[0].assessment == (
+        "Nicht bewertbar – Pflichtanalyse ausgelassen"
+    )
+
+
+def test_oos_case_open_and_close_preserve_result_and_update_sample_assessment():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    result = repo.table("results").loc[
+        repo.table("results").quality_status == "OOS"
+    ].iloc[0]
+    sample_id = repo.table("tasks").set_index("task_id").loc[result.task_id, "sample_id"]
+
+    case_id = workflow.open_oos_case(
+        result.result_id,
+        "Out-of-specification signal observed during review.",
+        actor="lead",
+        actor_role="Laborleitung",
+    )
+    case = repo.table("oos_cases").iloc[0]
+    assert case.case_id == case_id
+    assert case.result_id == result.result_id
+    assert case.status == "Offen"
+    assert sample_quality_view(repo).set_index("sample_id").loc[
+        sample_id, "assessment"
+    ] == "OOS – Untersuchung erforderlich"
+
+    workflow.close_oos_case(
+        case_id,
+        root_cause="Demo cause documented.",
+        corrective_action="Containment action recorded.",
+        closure_rationale="Investigation complete for demonstration.",
+        actor="lead",
+        actor_role="Laborleitung",
+    )
+    closed = repo.table("oos_cases").iloc[0]
+    assert closed.status == "Abgeschlossen"
+    assert closed.closed_by == "lead"
+    unchanged = repo.table("results").loc[
+        repo.table("results").result_id == result.result_id
+    ].iloc[0]
+    assert unchanged.quality_status == "OOS"
+    assert unchanged.review_status == result.review_status
+    assessment = sample_quality_view(repo).set_index("sample_id").loc[sample_id]
+    assert assessment.assessment == "OOS – Fall abgeschlossen; Ergebnis bleibt OOS"
+    assert assessment.oos_open_case_count == 0
+    assert assessment.oos_closed_case_count == 1
+    assert [event["action"] for event in repo.events(case_id)] == ["opened", "closed"]
+
+
+def test_oos_case_requires_lead_nonempty_reason_unique_result_and_complete_close():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    results = repo.table("results")
+    oos_result = results.loc[results.quality_status == "OOS"].iloc[0]
+    passing_result = results.loc[results.quality_status == "PASS"].iloc[0]
+    with pytest.raises(ValueError, match="Laborleitung"):
+        workflow.open_oos_case(
+            oos_result.result_id,
+            "Description",
+            actor="lab",
+            actor_role="Laborant",
+        )
+    with pytest.raises(ValueError, match="Erstbeschreibung"):
+        workflow.open_oos_case(
+            oos_result.result_id,
+            "",
+            actor="lead",
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="nur für ein OOS"):
+        workflow.open_oos_case(
+            passing_result.result_id,
+            "Description",
+            actor="lead",
+            actor_role="Laborleitung",
+        )
+
+    case_id = workflow.open_oos_case(
+        oos_result.result_id,
+        "Description",
+        actor="lead",
+        actor_role="Laborleitung",
+    )
+    with pytest.raises(ValueError, match="bereits ein OOS-Fall"):
+        workflow.open_oos_case(
+            oos_result.result_id,
+            "Duplicate",
+            actor="lead",
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="Ursachenbewertung"):
+        workflow.close_oos_case(
+            case_id,
+            root_cause="",
+            corrective_action="Action",
+            closure_rationale="Rationale",
+            actor="lead",
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="Laborleitung"):
+        workflow.close_oos_case(
+            case_id,
+            root_cause="Cause",
+            corrective_action="Action",
+            closure_rationale="Rationale",
+            actor="lab",
+            actor_role="Laborant",
+        )
 
 
 def test_invalid_transition_is_blocked():
@@ -223,6 +387,73 @@ def test_sample_creation_is_multi_order_atomic_and_idempotent():
     assert workflow.create_sample(**parameters) == created
     assert len(repo.table("samples")) == initial_samples + 1
     assert len(repo.table("tasks")) == initial_tasks + 4
+
+
+def test_sample_details_require_lead_and_record_each_change_with_reason():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    sample = repo.table("samples").iloc[0]
+    old_name = sample.sample_name
+    workflow.update_sample_details(
+        sample.sample_id,
+        sample_name="Stabilität 2026-10",
+        batch_id="CH-2026-007",
+        notes="Lagerung bei 25 °C",
+        reason="Korrektur anhand Eingangsprotokoll",
+        actor="lead",
+        actor_role="Laborleitung",
+    )
+    updated = repo.table("samples").loc[
+        repo.table("samples").sample_id == sample.sample_id
+    ].iloc[0]
+    assert updated.sample_name == "Stabilität 2026-10"
+    assert updated.batch_id == "CH-2026-007"
+    assert updated.notes == "Lagerung bei 25 °C"
+    changes = repo.events(sample.sample_id)
+    assert [event["action"] for event in changes[-3:]] == [
+        "sample_name_changed", "batch_id_changed", "notes_changed"
+    ]
+    assert changes[-3]["old_value"] == (str(old_name) if pd.notna(old_name) else None)
+    assert all(
+        event["reason"] == "Korrektur anhand Eingangsprotokoll"
+        for event in changes[-3:]
+    )
+
+
+def test_sample_details_reject_missing_reason_invalid_role_and_oversized_values():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    sample_id = repo.table("samples").iloc[0].sample_id
+    with pytest.raises(ValueError, match="Laborleitung"):
+        workflow.update_sample_details(
+            sample_id,
+            sample_name="Updated",
+            batch_id=None,
+            notes=None,
+            reason="Valid reason",
+            actor="lab",
+            actor_role="Laborant",
+        )
+    with pytest.raises(ValueError, match="Begründung"):
+        workflow.update_sample_details(
+            sample_id,
+            sample_name="Updated",
+            batch_id=None,
+            notes=None,
+            reason="",
+            actor="lead",
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="höchstens 200"):
+        workflow.update_sample_details(
+            sample_id,
+            sample_name="x" * 201,
+            batch_id=None,
+            notes=None,
+            reason="Valid reason",
+            actor="lead",
+            actor_role="Laborleitung",
+        )
 
 
 def test_required_method_omission_requires_reason_and_lab_lead():

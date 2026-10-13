@@ -54,6 +54,89 @@ def result_view(repo):
     )
 
 
+def sample_quality_view(repo):
+    samples = repo.table("samples").merge(
+        repo.table("products")[["product_id", "product"]],
+        on="product_id",
+    )
+    tasks = task_view(repo)
+    results = result_view(repo)
+    omitted_samples = {
+        event["entity_id"]
+        for event in repo.events()
+        if event["entity_type"] == "sample"
+        and event["action"] == "required_analyses_omitted"
+    }
+    oos_cases = repo.table("oos_cases")
+    case_status_by_result = (
+        oos_cases.set_index("result_id").status.to_dict()
+        if not oos_cases.empty
+        else {}
+    )
+    rows = []
+    for sample in samples.itertuples():
+        sample_tasks = tasks.loc[tasks.sample_id == sample.sample_id]
+        task_ids = set(sample_tasks.task_id)
+        current_results = results.loc[
+            results.task_id.isin(task_ids) & results.is_current.astype(bool)
+        ]
+        current_oos = current_results.loc[current_results.quality_status.eq("OOS")]
+        oos_requires_investigation = any(
+            case_status_by_result.get(result_id) != "Abgeschlossen"
+            for result_id in current_oos.result_id
+        )
+        required_tasks = sample_tasks.loc[sample_tasks.is_required.astype(bool)]
+        required_missing = not required_tasks.empty and (
+            not required_tasks.status.eq(TaskStatus.RELEASED.value).all()
+            or not required_tasks.task_id.isin(current_results.task_id).all()
+        )
+        all_tasks_complete = (
+            not sample_tasks.empty
+            and sample_tasks.status.eq(TaskStatus.RELEASED.value).all()
+            and set(sample_tasks.task_id).issubset(set(current_results.task_id))
+            and current_results.loc[
+                current_results.task_id.isin(task_ids), "review_status"
+            ].astype(str).str.startswith("freigegeben").all()
+            and current_results.loc[
+                current_results.task_id.isin(task_ids), "validity_status"
+            ].astype(str).str.startswith("gültig").all()
+        )
+        if oos_requires_investigation:
+            assessment = "OOS – Untersuchung erforderlich"
+        elif not current_oos.empty:
+            assessment = "OOS – Fall abgeschlossen; Ergebnis bleibt OOS"
+        elif sample.sample_id in omitted_samples:
+            assessment = "Nicht bewertbar – Pflichtanalyse ausgelassen"
+        elif required_missing or not all_tasks_complete:
+            assessment = "Nicht abschließend bewertbar"
+        elif current_results.quality_status.eq("GRENZNAH").any():
+            assessment = "Grenznah – fachliche Bewertung erforderlich"
+        elif current_results.quality_status.eq("PASS").all():
+            assessment = "Konform (Demo; keine Freigabe)"
+        else:
+            assessment = "Bewertung erforderlich"
+        rows.append({
+            "sample_id": sample.sample_id,
+            "product": sample.product,
+            "sample_type": sample.sample_type,
+            "batch_id": sample.batch_id,
+            "analysis_count": len(sample_tasks),
+            "required_count": int(sample_tasks.is_required.astype(bool).sum()),
+            "released_count": int(sample_tasks.status.eq(TaskStatus.RELEASED.value).sum()),
+            "oos_count": int(current_results.quality_status.eq("OOS").sum()),
+            "oos_open_case_count": sum(
+                case_status_by_result.get(result_id) != "Abgeschlossen"
+                for result_id in current_oos.result_id
+            ),
+            "oos_closed_case_count": sum(
+                case_status_by_result.get(result_id) == "Abgeschlossen"
+                for result_id in current_oos.result_id
+            ),
+            "assessment": assessment,
+        })
+    return pd.DataFrame(rows)
+
+
 def statistics(
     repo,
     product=None,
