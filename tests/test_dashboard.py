@@ -12,7 +12,7 @@ from domain.enums import TaskStatus
 from pages.operations import layout as operations_layout
 from services.analytics_service import result_view, task_view
 from services.auth_service import add_user
-from services.workflow_service import WorkflowService
+from services.workflow_service import SAMPLE_TYPES, WorkflowService
 
 client = app.server.test_client()
 
@@ -351,12 +351,13 @@ def test_sample_detail_callback_shows_order_and_result_history(isolated_logged_i
             {"id": "sample-edit-name", "property": "value"},
             {"id": "sample-edit-batch", "property": "value"},
             {"id": "sample-edit-notes", "property": "value"},
+            {"id": "sample-edit-type", "property": "value"},
         ],
         [
-            {"id": "sample-detail-id", "property": "value", "value": sample_id},
+            {"id": "sample-detail-id", "property": "data", "value": sample_id},
             {"id": "sample-detail-revision", "property": "data", "value": 0},
         ],
-        changed="sample-detail-id.value",
+        changed="sample-detail-id.data",
     )
     assert response.status_code == 200
     children = response.get_json()["response"]["sample-detail-content"]["children"]
@@ -364,9 +365,93 @@ def test_sample_detail_callback_shows_order_and_result_history(isolated_logged_i
     assert "Messungen und Ergebnisversionen" in str(children)
 
 
+def test_selecting_queue_order_selects_its_sample_for_detail(isolated_logged_in_user):
+    task = isolated_logged_in_user.table("tasks").iloc[0]
+    output = next(
+        key for key in app.callback_map
+        if key.startswith("sample-detail-id.data")
+    )
+    selected = callback_request(
+        output,
+        {"id": "sample-detail-id", "property": "data"},
+        [
+            {"id": "queue", "property": "selected_row_ids", "value": [task.task_id]},
+            {"id": "queue", "property": "active_cell", "value": None},
+        ],
+        [{"id": "queue", "property": "data", "value": []}],
+        changed="queue.selected_row_ids",
+    )
+    assert selected.status_code == 200
+    assert selected.get_json()["response"]["sample-detail-id"]["data"] == task.sample_id
+
+    clicked = callback_request(
+        output,
+        {"id": "sample-detail-id", "property": "data"},
+        [
+            {"id": "queue", "property": "selected_row_ids", "value": []},
+            {
+                "id": "queue",
+                "property": "active_cell",
+                "value": {"row": 0, "column": 0, "row_id": task.task_id},
+            },
+        ],
+        [{"id": "queue", "property": "data", "value": [{"id": task.task_id}]}],
+        changed="queue.active_cell",
+    )
+    assert clicked.status_code == 200
+    assert clicked.get_json()["response"]["sample-detail-id"]["data"] == task.sample_id
+
+    modal_output = next(
+        key for key in app.callback_map
+        if key.startswith("sample-detail-modal.style")
+    )
+    opened = callback_request(
+        modal_output,
+        {"id": "sample-detail-modal", "property": "style"},
+        [{"id": "sample-detail-id", "property": "data", "value": task.sample_id}],
+        changed="sample-detail-id.data",
+    )
+    assert opened.status_code == 200
+    assert opened.get_json()["response"]["sample-detail-modal"]["style"]["display"] == "flex"
+
+    close_output = next(
+        key for key in app.callback_map
+        if key.startswith("..sample-detail-id.data")
+    )
+    closed = callback_request(
+        close_output,
+        [
+            {"id": "sample-detail-id", "property": "data"},
+            {"id": "queue", "property": "selected_row_ids"},
+            {"id": "queue", "property": "active_cell"},
+        ],
+        [{"id": "sample-detail-close", "property": "n_clicks", "value": 1}],
+        changed="sample-detail-close.n_clicks",
+    )
+    assert closed.status_code == 200
+    assert closed.get_json()["response"]["sample-detail-id"]["data"] is None
+    assert closed.get_json()["response"]["queue"]["selected_row_ids"] == []
+    assert closed.get_json()["response"]["queue"]["active_cell"] is None
+
+    hidden = callback_request(
+        modal_output,
+        {"id": "sample-detail-modal", "property": "style"},
+        [{"id": "sample-detail-id", "property": "data", "value": None}],
+        changed="sample-detail-id.data",
+    )
+    assert hidden.status_code == 200
+    assert hidden.get_json()["response"]["sample-detail-modal"]["style"]["display"] == "none"
+
+
 def test_sample_update_callback_saves_only_for_lab_lead(isolated_logged_in_user):
     local_repo = isolated_logged_in_user
     sample_id = local_repo.table("samples").iloc[0].sample_id
+    original_sample_type = local_repo.table("samples").loc[
+        local_repo.table("samples").sample_id == sample_id, "sample_type"
+    ].iloc[0]
+    new_sample_type = next(
+        value for value in SAMPLE_TYPES if value != original_sample_type
+    )
     output = next(
         key for key in app.callback_map
         if key.startswith("..sample-edit-message.children...")
@@ -379,10 +464,11 @@ def test_sample_update_callback_saves_only_for_lab_lead(isolated_logged_in_user)
         ],
         [{"id": "sample-edit-save", "property": "n_clicks", "value": 1}],
         [
-            {"id": "sample-detail-id", "property": "value", "value": sample_id},
+            {"id": "sample-detail-id", "property": "data", "value": sample_id},
             {"id": "sample-edit-name", "property": "value", "value": "Edited sample"},
             {"id": "sample-edit-batch", "property": "value", "value": "B-EDITED"},
             {"id": "sample-edit-notes", "property": "value", "value": "Updated in UI"},
+            {"id": "sample-edit-type", "property": "value", "value": new_sample_type},
             {"id": "sample-edit-reason", "property": "value", "value": "Incoming record correction"},
             {"id": "sample-detail-revision", "property": "data", "value": 0},
         ],
@@ -395,6 +481,7 @@ def test_sample_update_callback_saves_only_for_lab_lead(isolated_logged_in_user)
         local_repo.table("samples").sample_id == sample_id
     ].iloc[0]
     assert saved.sample_name == "Edited sample"
+    assert saved.sample_type == new_sample_type
     with client.session_transaction() as user_session:
         user_session["username"] = "lab"
     denied = callback_request(
@@ -405,10 +492,11 @@ def test_sample_update_callback_saves_only_for_lab_lead(isolated_logged_in_user)
         ],
         [{"id": "sample-edit-save", "property": "n_clicks", "value": 2}],
         [
-            {"id": "sample-detail-id", "property": "value", "value": sample_id},
+            {"id": "sample-detail-id", "property": "data", "value": sample_id},
             {"id": "sample-edit-name", "property": "value", "value": "Must not persist"},
             {"id": "sample-edit-batch", "property": "value", "value": "B"},
             {"id": "sample-edit-notes", "property": "value", "value": "No"},
+            {"id": "sample-edit-type", "property": "value", "value": "Rohstoff"},
             {"id": "sample-edit-reason", "property": "value", "value": "Reason"},
             {"id": "sample-detail-revision", "property": "data", "value": 1},
         ],
@@ -419,6 +507,45 @@ def test_sample_update_callback_saves_only_for_lab_lead(isolated_logged_in_user)
     assert local_repo.table("samples").loc[
         local_repo.table("samples").sample_id == sample_id, "sample_name"
     ].iloc[0] == "Edited sample"
+    assert local_repo.table("samples").loc[
+        local_repo.table("samples").sample_id == sample_id, "sample_type"
+    ].iloc[0] == new_sample_type
+
+
+def test_specification_version_callback_refreshes_active_demo_plan(isolated_logged_in_user):
+    local_repo = isolated_logged_in_user
+    output = next(
+        key for key in app.callback_map
+        if key.startswith("..spec-message.children...")
+    )
+    outputs = [
+        {"id": item.component_id, "property": item.component_property}
+        for item in app.callback_map[output]["output"]
+    ]
+    response = callback_request(
+        output,
+        outputs,
+        [{"id": "spec-create", "property": "n_clicks", "value": 1}],
+        [
+            {"id": "spec-product", "property": "value", "value": "P-001"},
+            {"id": "spec-method", "property": "value", "value": "M-GC"},
+            {"id": "spec-target", "property": "value", "value": 99.6},
+            {"id": "spec-lsl", "property": "value", "value": 98.8},
+            {"id": "spec-usl", "property": "value", "value": 99.9},
+            {"id": "spec-sigma", "property": "value", "value": 0.2},
+            {"id": "spec-reason", "property": "value", "value": "Dash demo version test"},
+        ],
+        "spec-create.n_clicks",
+    )
+    assert response.status_code == 200
+    result = response.get_json()["response"]
+    assert "DEMO-2 wurde aktiviert" in result["spec-message"]["children"]
+    active = local_repo.table("specifications")
+    active = active.loc[
+        active.product_id.eq("P-001") & active.active.astype(bool)
+    ]
+    assert set(active.version) == {"DEMO-2"}
+    assert result["active-specification-table"]["children"]["type"] == "DataTable"
 
 
 def test_oos_case_management_callback_opens_and_closes_case(isolated_logged_in_user):

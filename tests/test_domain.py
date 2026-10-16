@@ -7,7 +7,7 @@ from domain.quality import assess
 from domain.statistics import process_statistics
 from domain.workflow import validate_transition
 from services.analytics_service import sample_quality_view
-from services.workflow_service import WorkflowService
+from services.workflow_service import SAMPLE_TYPES, WorkflowService
 from services.auth_service import add_user, authenticate, reset_password
 
 
@@ -389,16 +389,142 @@ def test_sample_creation_is_multi_order_atomic_and_idempotent():
     assert len(repo.table("tasks")) == initial_tasks + 4
 
 
+def test_specification_versions_are_immutable_and_snapshotted_to_new_samples():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    existing_sample = repo.table("samples").loc[
+        repo.table("samples").product_id.eq("P-001")
+    ].iloc[0]
+    existing_sample_task = repo.table("tasks").loc[
+        repo.table("tasks").sample_id.eq(existing_sample.sample_id)
+        & repo.table("tasks").method_id.eq("M-GC")
+    ].iloc[0]
+    assert existing_sample.specification_version == "DEMO-1"
+    old_target = existing_sample_task.target
+    assert existing_sample_task.specification_version == "DEMO-1"
+
+    version = workflow.create_specification_version(
+        "P-001",
+        "M-GC",
+        target=99.6,
+        lsl=98.8,
+        usl=99.9,
+        sigma=0.2,
+        reason="Demo-Grenzen für Versionsprüfung",
+        actor="lead",
+        actor_role="Laborleitung",
+    )
+    assert version == "DEMO-2"
+    old_task_after_version = repo.table("tasks").loc[
+        repo.table("tasks").task_id.eq(existing_sample_task.task_id)
+    ].iloc[0]
+    assert old_task_after_version.target == old_target
+    assert old_task_after_version.specification_version == "DEMO-1"
+
+    active = repo.table("specifications").loc[
+        repo.table("specifications").product_id.eq("P-001")
+        & repo.table("specifications").active.astype(bool)
+    ]
+    assert set(active.version) == {"DEMO-2"}
+    assert len(active) == len(
+        repo.table("specifications").loc[
+            repo.table("specifications").product_id.eq("P-001")
+            & repo.table("specifications").version.eq("DEMO-1")
+        ]
+    )
+
+    sample_id, task_ids = workflow.create_sample(
+        product_id="P-001",
+        sample_type="Rohstoff",
+        methods=active.method_id.tolist(),
+        received_at=datetime.now(),
+        actor="lead",
+        actor_role="Laborleitung",
+    )
+    new_task = repo.table("tasks").loc[
+        repo.table("tasks").task_id.isin(task_ids)
+        & repo.table("tasks").method_id.eq("M-GC")
+    ].iloc[0]
+    assert repo.table("samples").loc[
+        repo.table("samples").sample_id.eq(sample_id), "specification_version"
+    ].iloc[0] == "DEMO-2"
+    assert (
+        new_task.specification_version,
+        new_task.target,
+        new_task.lsl,
+        new_task.usl,
+        new_task.sigma,
+    ) == ("DEMO-2", 99.6, 98.8, 99.9, 0.2)
+
+    with repo.transaction():
+        tasks = repo.table("tasks")
+        task_idx = tasks.index[tasks.task_id.eq(new_task.task_id)][0]
+        tasks.at[task_idx, "status"] = "In Bearbeitung"
+        tasks.at[task_idx, "assignee_id"] = "E-01"
+        repo.replace("tasks", tasks)
+    result_id = workflow.record_result(
+        new_task.task_id,
+        99.7,
+        actor="chemist",
+        actor_employee_id="E-01",
+        actor_role="Laborant",
+    )
+    result = repo.table("results").loc[
+        repo.table("results").result_id.eq(result_id)
+    ].iloc[0]
+    assert result.specification_version == "DEMO-2"
+    assert (result.target, result.lsl, result.usl) == (99.6, 98.8, 99.9)
+
+
+def test_specification_versioning_requires_lab_lead_and_valid_complete_limits():
+    repo = Repository(":memory:")
+    workflow = WorkflowService(repo)
+    parameters = {
+        "target": 99.6,
+        "lsl": 98.8,
+        "usl": 99.9,
+        "sigma": 0.2,
+        "reason": "Demo version test",
+        "actor": "lead",
+    }
+    with pytest.raises(ValueError, match="Laborleitung"):
+        workflow.create_specification_version(
+            "P-001", "M-GC", **parameters, actor_role="Laborant"
+        )
+    with pytest.raises(ValueError, match="Begründung"):
+        workflow.create_specification_version(
+            "P-001", "M-GC", **{**parameters, "reason": ""},
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="Untergrenze"):
+        workflow.create_specification_version(
+            "P-001", "M-GC", **{**parameters, "lsl": 100.0},
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="Streuung"):
+        workflow.create_specification_version(
+            "P-001", "M-GC", **{**parameters, "sigma": 0.0},
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="gehört nicht"):
+        workflow.create_specification_version(
+            "P-001", "M-NIR", **parameters, actor_role="Laborleitung"
+        )
+
+
 def test_sample_details_require_lead_and_record_each_change_with_reason():
     repo = Repository(":memory:")
     workflow = WorkflowService(repo)
     sample = repo.table("samples").iloc[0]
     old_name = sample.sample_name
+    old_type = sample.sample_type
+    new_type = next(value for value in SAMPLE_TYPES if value != old_type)
     workflow.update_sample_details(
         sample.sample_id,
         sample_name="Stabilität 2026-10",
         batch_id="CH-2026-007",
         notes="Lagerung bei 25 °C",
+        sample_type=new_type,
         reason="Korrektur anhand Eingangsprotokoll",
         actor="lead",
         actor_role="Laborleitung",
@@ -409,14 +535,16 @@ def test_sample_details_require_lead_and_record_each_change_with_reason():
     assert updated.sample_name == "Stabilität 2026-10"
     assert updated.batch_id == "CH-2026-007"
     assert updated.notes == "Lagerung bei 25 °C"
+    assert updated.sample_type == new_type
     changes = repo.events(sample.sample_id)
-    assert [event["action"] for event in changes[-3:]] == [
-        "sample_name_changed", "batch_id_changed", "notes_changed"
+    assert [event["action"] for event in changes[-4:]] == [
+        "sample_name_changed", "batch_id_changed", "notes_changed", "sample_type_changed"
     ]
-    assert changes[-3]["old_value"] == (str(old_name) if pd.notna(old_name) else None)
+    assert changes[-4]["old_value"] == (str(old_name) if pd.notna(old_name) else None)
+    assert changes[-1]["old_value"] == old_type
     assert all(
         event["reason"] == "Korrektur anhand Eingangsprotokoll"
-        for event in changes[-3:]
+        for event in changes[-4:]
     )
 
 
@@ -430,6 +558,7 @@ def test_sample_details_reject_missing_reason_invalid_role_and_oversized_values(
             sample_name="Updated",
             batch_id=None,
             notes=None,
+            sample_type="Sonderprobe",
             reason="Valid reason",
             actor="lab",
             actor_role="Laborant",
@@ -440,6 +569,7 @@ def test_sample_details_reject_missing_reason_invalid_role_and_oversized_values(
             sample_name="Updated",
             batch_id=None,
             notes=None,
+            sample_type="Sonderprobe",
             reason="",
             actor="lead",
             actor_role="Laborleitung",
@@ -450,6 +580,18 @@ def test_sample_details_reject_missing_reason_invalid_role_and_oversized_values(
             sample_name="x" * 201,
             batch_id=None,
             notes=None,
+            sample_type="Sonderprobe",
+            reason="Valid reason",
+            actor="lead",
+            actor_role="Laborleitung",
+        )
+    with pytest.raises(ValueError, match="gültige Probenart"):
+        workflow.update_sample_details(
+            sample_id,
+            sample_name="Updated",
+            batch_id=None,
+            notes=None,
+            sample_type="Ungültig",
             reason="Valid reason",
             actor="lead",
             actor_role="Laborleitung",

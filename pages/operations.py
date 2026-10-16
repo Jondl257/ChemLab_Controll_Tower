@@ -5,7 +5,6 @@ import pandas as pd
 import plotly.express as px
 
 from components.ui import kpi
-from data.master_data import PLANS
 from services.analytics_service import result_view, task_view, queue_records, queue_masks
 from services.workflow_service import SAMPLE_TYPES
 
@@ -75,28 +74,31 @@ def _sample_form(repo):
     products = repo.table("products")
     first_product = products.iloc[0].product_id
     methods = repo.table("methods").set_index("method_id")
+    specifications = repo.table("specifications")
+    active_plan = specifications.loc[
+        specifications.product_id.eq(first_product)
+        & specifications.active.astype(bool)
+    ]
     method_options = [
         {
             "label": f"{methods.loc[method_id, 'method']} — {methods.loc[method_id, 'parameter']} "
-                     f"({methods.loc[method_id, 'unit']}) · Pflicht (Demo)"
-                     if required else
-                     f"{methods.loc[method_id, 'method']} — {methods.loc[method_id, 'parameter']} "
-                     f"({methods.loc[method_id, 'unit']}) · Zusatz",
+                     f"({methods.loc[method_id, 'unit']}) · "
+                     f"{'Pflicht' if required else 'Zusatz'} (Demo)",
             "value": method_id,
         }
-        for method_id, _, _, _, _ in PLANS[first_product]
-        for required in (True,)
+        for method_id, required in zip(active_plan.method_id, active_plan.is_required)
     ]
     product_options = [
         {"label": row.product, "value": row.product_id}
         for row in products.itertuples()
     ]
+    version = str(active_plan.version.iloc[0]) if not active_plan.empty else "nicht verfügbar"
     received = __import__("datetime").datetime.now().strftime("%Y-%m-%dT%H:%M")
     return html.Details([
         html.Summary("Neue Probe und mehrere Analyseaufträge anlegen"),
         html.P(
-            "Demo-Regel: Produktbasisplan vorausgewählt; bestehende Spezifikationen sind "
-            "synthetisch. Die Berechtigung für die Anlage wird aus dem lokalen Benutzerkonto geprüft.",
+            f"Demo-Regel: aktive Planspezifikation {version} wird beim Anlegen an der Probe "
+            "und ihren Analyseaufträgen festgeschrieben. Alle Spezifikationswerte sind synthetisch.",
             className="note",
         ),
         html.Div([
@@ -123,6 +125,60 @@ def _sample_form(repo):
             html.Div(id="sample-message", className="message"),
             dcc.Store(id="sample-submission-key", data=str(uuid4())),
         ], className="sample-form"),
+    ])
+
+
+def active_specification_content(repo):
+    specifications = repo.table("specifications")
+    active = specifications.loc[specifications.active.astype(bool)]
+    products = repo.table("products")[["product_id", "product"]]
+    methods = repo.table("methods")[["method_id", "method", "parameter", "unit"]]
+    active = active.merge(products, on="product_id").merge(methods, on="method_id")
+    columns = [
+        "product", "version", "method", "parameter", "target", "lsl", "usl",
+        "sigma", "is_required",
+    ]
+    labels = [
+        "Produkt", "Aktive Version", "Methode", "Parameter", "Sollwert",
+        "Untergrenze", "Obergrenze", "Demo-Streuung", "Pflicht",
+    ]
+    return dash_table.DataTable(
+        active[columns].rename(columns=dict(zip(columns, labels))).fillna("").astype(str).to_dict("records"),
+        [{"name": label, "id": label} for label in labels],
+        page_size=12,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+    )
+
+
+def _specification_version_form(repo):
+    products = repo.table("products")
+    first_product = products.iloc[0].product_id
+    product_options = [
+        {"label": row.product, "value": row.product_id}
+        for row in products.itertuples()
+    ]
+    return html.Details([
+        html.Summary("Demo-Spezifikation versionieren"),
+        html.P(
+            "Erstellt eine neue aktive Version durch Kopieren des bestehenden Plans und "
+            "Ändern genau einer Methode. Vorhandene Proben/Aufträge behalten ihre Version; "
+            "diese Demo-Werte sind nicht fachlich validiert.",
+            className="note",
+        ),
+        html.Div([
+            dcc.Dropdown(product_options, first_product, id="spec-product", clearable=False),
+            dcc.Dropdown(id="spec-method", placeholder="Methode der aktiven Version", clearable=False),
+            dcc.Input(id="spec-target", type="number", placeholder="Sollwert", step="any"),
+            dcc.Input(id="spec-lsl", type="number", placeholder="Untergrenze", step="any"),
+            dcc.Input(id="spec-usl", type="number", placeholder="Obergrenze", step="any"),
+            dcc.Input(id="spec-sigma", type="number", placeholder="Demo-Streuung > 0", min=0, step="any"),
+            dcc.Textarea(id="spec-reason", placeholder="Begründung der Demo-Version (erforderlich)"),
+            html.Button("Neue Version erstellen", id="spec-create", className="primary"),
+            html.Div(id="spec-message", className="message"),
+        ], className="sample-form"),
+        html.H4("Aktive Demo-Spezifikationen"),
+        html.Div(active_specification_content(repo), id="active-specification-table"),
     ])
 
 
@@ -158,8 +214,14 @@ def sample_detail_content(repo, sample_id):
     sample = selected.iloc[0]
     tasks = task_view(repo)
     tasks = tasks.loc[tasks.sample_id == sample_id]
-    task_columns = ["task_id", "method", "status", "priority", "deadline", "employee"]
-    task_labels = ["Auftrag", "Methode", "Status", "Priorität", "Fälligkeit", "Bearbeiter"]
+    task_columns = [
+        "task_id", "method", "specification_version", "status", "priority",
+        "deadline", "employee",
+    ]
+    task_labels = [
+        "Auftrag", "Methode", "Spezifikationsversion", "Status", "Priorität",
+        "Fälligkeit", "Bearbeiter",
+    ]
     task_records = tasks[task_columns].fillna("").astype(str).to_dict("records")
     task_table = dash_table.DataTable(
         task_records,
@@ -176,12 +238,12 @@ def sample_detail_content(repo, sample_id):
     result_columns = [
         "task_id", "parameter", "value", "unit", "quality_status",
         "result_version", "is_current", "review_status", "measured_at",
-        "released_at", "recorded_by", "released_by", "comment",
+        "released_at", "specification_version", "recorded_by", "released_by", "comment",
     ]
     result_labels = [
         "Auftrag", "Parameter", "Messwert", "Einheit", "QC-Status",
         "Version", "Maßgeblich", "Prüfstatus", "Gemessen", "Freigegeben",
-        "Erfasst von", "Freigegeben von", "Kommentar",
+        "Spezifikationsversion", "Erfasst von", "Freigegeben von", "Kommentar",
     ]
     result_table = dash_table.DataTable(
         results[result_columns].fillna("").astype(str).to_dict("records"),
@@ -208,7 +270,8 @@ def sample_detail_content(repo, sample_id):
     return html.Div([
         html.P(
             f"Probe {sample.sample_id} · {product} · {sample.sample_type} · "
-            f"Eingang: {sample.received_at} · Angelegt von: {sample.created_by}"
+            f"Eingang: {sample.received_at} · "
+            f"Spezifikation: {sample.specification_version} · Angelegt von: {sample.created_by}"
         ),
         html.H4("Analyseaufträge"),
         task_table,
@@ -241,6 +304,7 @@ def layout(repo, is_admin=False, can_edit_samples=False):
         row_selectable="single",
         style_table={"overflowX": "auto"},
         style_cell={"fontFamily": "Arial", "fontSize": 12, "padding": "8px", "textAlign": "left"},
+        style_data={"cursor": "pointer"},
         hidden_columns=["instrument_id", "batch_id", "product_class"],
     )
     cards = [
@@ -305,7 +369,6 @@ def layout(repo, is_admin=False, can_edit_samples=False):
         html.Div(id="workflow-message", className="message"),
     ])
     admin_panel = []
-    available_samples = sample_options(repo)
     if is_admin:
         employees = repo.table("employees")
         admin_panel = [html.Details([
@@ -359,6 +422,10 @@ def layout(repo, is_admin=False, can_edit_samples=False):
         html.Div(cards, className="kpi-grid"),
         dcc.Graph(figure=chart),
         html.H3("Analyse-Queue"),
+        html.P(
+            "Eine Queue-Zeile anklicken oder ihren Auswahlkreis verwenden, um die zugehörige Probe im Popup anzusehen.",
+            className="note",
+        ),
         html.Div([
             html.Span("Aktive Aufträge", id="queue-filter-label"),
             dcc.Input(id="queue-search", type="search", placeholder="Auftrag, Probe, Produkt oder Charge suchen"),
@@ -378,21 +445,32 @@ def layout(repo, is_admin=False, can_edit_samples=False):
         table,
         controls,
         _sample_form(repo),
-        html.Details([
-            html.Summary("Probe ansehen und Probendaten bearbeiten"),
-            dcc.Dropdown(
-                available_samples,
-                available_samples[-1]["value"] if available_samples else None,
-                id="sample-detail-id",
-                placeholder="Probe auswählen",
-                clearable=False,
-            ),
+        dcc.Store(id="sample-detail-id", data=None),
+        dcc.Store(id="sample-detail-dismissed", data=False),
+        html.Div([
+            html.Div([
+                html.Div([
+                    html.H2("Probendetails", id="sample-detail-title"),
+                    html.Button(
+                        "Schließen",
+                        id="sample-detail-close",
+                        className="secondary",
+                        **{"aria-label": "Probendetails schließen"},
+                    ),
+                ], className="sample-modal-header"),
             html.Div(id="sample-detail-content"),
             html.H4("Stammdaten ändern"),
             html.Div([
                 dcc.Input(id="sample-edit-name", type="text", placeholder="Probenbezeichnung", disabled=not can_edit_samples),
                 dcc.Input(id="sample-edit-batch", type="text", placeholder="Charge", disabled=not can_edit_samples),
                 dcc.Textarea(id="sample-edit-notes", placeholder="Notiz", disabled=not can_edit_samples),
+                dcc.Dropdown(
+                    [{"label": value, "value": value} for value in SAMPLE_TYPES],
+                    id="sample-edit-type",
+                    clearable=False,
+                    placeholder="Probenart",
+                    disabled=not can_edit_samples,
+                ),
                 dcc.Textarea(
                     id="sample-edit-reason",
                     placeholder="Begründung (erforderlich)",
@@ -407,6 +485,8 @@ def layout(repo, is_admin=False, can_edit_samples=False):
             ], className="sample-form"),
             html.Div(id="sample-edit-message", className="message"),
             dcc.Store(id="sample-detail-revision", data=0),
-        ]),
+            ], className="sample-modal-panel", role="dialog", **{"aria-modal": "true"}),
+        ], id="sample-detail-modal", className="sample-modal", style={"display": "none"}),
         *admin_panel,
+        *([_specification_version_form(repo)] if can_edit_samples else []),
     ])

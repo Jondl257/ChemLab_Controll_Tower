@@ -6,7 +6,6 @@ from uuid import uuid4
 import pandas as pd
 
 from config import deadline
-from data.master_data import PLANS
 from domain.enums import Role, TaskPriority, TaskStatus
 from domain.quality import assess
 from domain.workflow import validate_transition
@@ -80,9 +79,17 @@ class WorkflowService:
         if not set(normalized_methods).issubset(known_methods):
             raise ValueError("Eine ausgewählte Methode ist nicht vorhanden.")
 
-        plan = PLANS[product_id]
-        plan_methods = [item[0] for item in plan]
-        missing_required = set(plan_methods) - set(normalized_methods)
+        plan_rows = self.repo.table("specifications")
+        plan_rows = plan_rows.loc[
+            plan_rows.product_id.eq(product_id) & plan_rows.active.astype(bool)
+        ]
+        if plan_rows.empty or plan_rows.version.nunique() != 1:
+            raise ValueError("Für dieses Produkt ist keine eindeutige aktive Demo-Spezifikation vorhanden.")
+        specification_version = str(plan_rows.version.iloc[0])
+        required_methods = set(
+            plan_rows.loc[plan_rows.is_required.astype(bool), "method_id"]
+        )
+        missing_required = required_methods - set(normalized_methods)
         if missing_required and (
             actor_role != Role.LABORLEITUNG.value or not (omission_reason or "").strip()
         ):
@@ -104,9 +111,14 @@ class WorkflowService:
             task_ids = []
             for method_id in normalized_methods:
                 task_id = _next_id(pd.concat([tasks, pd.DataFrame(tasks_to_add)], ignore_index=True), "task_id", "A-", 5)
-                specification = next((item for item in plan if item[0] == method_id), None)
+                specification_rows = plan_rows.loc[plan_rows.method_id == method_id]
+                specification = (
+                    specification_rows.iloc[0]
+                    if len(specification_rows) == 1
+                    else None
+                )
                 method = methods_table.loc[methods_table.method_id == method_id].iloc[0]
-                is_required = method_id in plan_methods
+                is_required = bool(specification.is_required) if specification is not None else False
                 instrument_ids = method.eligible_instruments.split("|")
                 tasks_to_add.append({
                     "task_id": task_id,
@@ -125,8 +137,12 @@ class WorkflowService:
                     "system_priority": priority,
                     "manual_priority": None,
                     "manual_priority_reason": None,
-                    "specification_version": "DEMO-1" if specification else None,
-                    "calculation_rule": "Einzelwert-Demo" if specification else None,
+                    "specification_version": specification_version if specification is not None else None,
+                    "calculation_rule": specification.calculation_rule if specification is not None else None,
+                    "target": specification.target if specification is not None else None,
+                    "lsl": specification.lsl if specification is not None else None,
+                    "usl": specification.usl if specification is not None else None,
+                    "sigma": specification.sigma if specification is not None else None,
                     "completed_at": None,
                 })
             sample = {
@@ -137,6 +153,7 @@ class WorkflowService:
                 "received_at": received_at,
                 "sample_name": (sample_name or "").strip() or None,
                 "notes": (notes or "").strip() or None,
+                "specification_version": specification_version,
                 "created_at": datetime.now(),
                 "created_by": actor,
             }
@@ -170,6 +187,7 @@ class WorkflowService:
         sample_name: str | None,
         batch_id: str | None,
         notes: str | None,
+        sample_type: str,
         reason: str,
         actor: str,
         actor_role: str,
@@ -183,13 +201,17 @@ class WorkflowService:
             "sample_name": (sample_name or "").strip() or None,
             "batch_id": (batch_id or "").strip() or None,
             "notes": (notes or "").strip() or None,
+            "sample_type": (sample_type or "").strip(),
         }
         limits = {"sample_name": 200, "batch_id": 100, "notes": 2000}
-        for field, value in values.items():
-            if value is not None and len(value) > limits[field]:
+        for field, limit in limits.items():
+            value = values[field]
+            if value is not None and len(value) > limit:
                 raise ValueError(
-                    f"Das Feld {field} darf höchstens {limits[field]} Zeichen enthalten."
+                    f"Das Feld {field} darf höchstens {limit} Zeichen enthalten."
                 )
+        if values["sample_type"] not in SAMPLE_TYPES:
+            raise ValueError("Bitte eine gültige Probenart auswählen.")
 
         with self.repo.transaction():
             samples = self.repo.table("samples")
@@ -218,6 +240,81 @@ class WorkflowService:
                     new_value=new_value,
                     reason=normalized_reason,
                 )
+
+    def create_specification_version(
+        self,
+        product_id: str,
+        method_id: str,
+        *,
+        target: float,
+        lsl: float,
+        usl: float,
+        sigma: float,
+        reason: str,
+        actor: str,
+        actor_role: str,
+    ) -> str:
+        if actor_role != Role.LABORLEITUNG.value:
+            raise ValueError("Nur die Laborleitung darf Demo-Spezifikationen versionieren.")
+        normalized_reason = (reason or "").strip()
+        if not normalized_reason:
+            raise ValueError("Für eine neue Spezifikationsversion ist eine Begründung erforderlich.")
+        if len(normalized_reason) > 1000:
+            raise ValueError("Die Begründung darf höchstens 1000 Zeichen enthalten.")
+        try:
+            numeric_values = {
+                "target": float(target),
+                "lsl": float(lsl),
+                "usl": float(usl),
+                "sigma": float(sigma),
+            }
+        except (TypeError, ValueError):
+            raise ValueError("Sollwert, Grenzen und Streuung müssen Zahlen sein.") from None
+        if not all(math.isfinite(value) for value in numeric_values.values()):
+            raise ValueError("Sollwert, Grenzen und Streuung müssen endliche Zahlen sein.")
+        if numeric_values["lsl"] > numeric_values["usl"]:
+            raise ValueError("Die Untergrenze darf die Obergrenze nicht überschreiten.")
+        if not numeric_values["lsl"] <= numeric_values["target"] <= numeric_values["usl"]:
+            raise ValueError("Der Sollwert muss innerhalb der Demo-Grenzen liegen.")
+        if numeric_values["sigma"] <= 0:
+            raise ValueError("Die Demo-Streuung muss größer als 0 sein.")
+
+        with self.repo.transaction():
+            specifications = self.repo.table("specifications")
+            active = specifications.loc[
+                specifications.product_id.eq(product_id)
+                & specifications.active.astype(bool)
+            ]
+            if active.empty or active.version.nunique() != 1:
+                raise ValueError("Für dieses Produkt existiert keine eindeutige aktive Spezifikation.")
+            methods = active.loc[active.method_id.eq(method_id)]
+            if len(methods) != 1:
+                raise ValueError("Die Methode gehört nicht zur aktiven Produktspezifikation.")
+            method_index = methods.index[0]
+            product_specs = active.copy()
+            current_version = str(active.version.iloc[0])
+            version_number = int(current_version.rsplit("-", 1)[-1]) + 1
+            new_version = f"DEMO-{version_number}"
+            specifications.loc[active.index, "active"] = 0
+            product_specs.loc[method_index, list(numeric_values)] = list(
+                numeric_values.values()
+            )
+            product_specs["version"] = new_version
+            product_specs["active"] = 1
+            versioned = pd.concat(
+                [specifications, product_specs], ignore_index=True
+            )
+            self.repo.replace("specifications", versioned)
+            self.repo.log_event(
+                "specification",
+                f"{product_id}:{new_version}",
+                "version_created",
+                actor,
+                old_value=current_version,
+                new_value=f"{method_id}: {numeric_values}",
+                reason=normalized_reason,
+            )
+        return new_version
 
     def transition(
         self,
@@ -589,10 +686,9 @@ class WorkflowService:
             if len(method_rows) != 1:
                 raise ValueError("Methode des Analyseauftrags nicht gefunden.")
             method = method_rows.iloc[0]
-            plan = next((item for item in PLANS[task.product_id] if item[0] == task.method_id), None)
-            if plan is None:
+            if pd.isna(task.specification_version) or pd.isna(task.target):
                 raise ValueError("Für diese Methode fehlt eine Demo-Spezifikation; Ergebnisaufnahme ist gesperrt.")
-            _, target, lsl, usl, _ = plan
+            target, lsl, usl = task.target, task.lsl, task.usl
             if lsl is not None and usl is not None and lsl > usl:
                 raise ValueError("Die hinterlegte Spezifikation ist ungültig.")
             numeric_value = float(value)
@@ -619,8 +715,8 @@ class WorkflowService:
                 "validity_status": "gültig",
                 "review_status": "Prüfung erforderlich",
                 "released_at": None,
-                "specification_version": "DEMO-1",
-                "calculation_rule": "Einzelwert-Demo",
+                "specification_version": task.specification_version,
+                "calculation_rule": task.calculation_rule,
                 "recorded_by": actor,
                 "released_by": None,
             }

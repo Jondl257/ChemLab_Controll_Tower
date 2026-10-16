@@ -13,7 +13,6 @@ from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 from flask import session
 import pandas as pd
 from data.repository import Repository
-from data.master_data import PLANS
 from pages import operations, quality, statistics
 from config import APP_TITLE
 from services.auth_service import authenticate
@@ -135,42 +134,97 @@ def page(tab, auth_revision):
     Output("sample-edit-name", "value"),
     Output("sample-edit-batch", "value"),
     Output("sample-edit-notes", "value"),
-    Input("sample-detail-id", "value"),
+    Output("sample-edit-type", "value"),
+    Input("sample-detail-id", "data"),
     Input("sample-detail-revision", "data"),
 )
 def sample_detail(sample_id, revision):
     _ = revision
     if current_user() is None:
-        return html.P("Bitte zuerst lokal anmelden."), None, None, None
+        return html.P("Bitte zuerst lokal anmelden."), None, None, None, None
     if not sample_id:
-        return html.P("Keine Probe ausgewählt."), None, None, None
+        return html.P("Keine Probe ausgewählt."), None, None, None, None
     sample = repo.table("samples")
     selected = sample.loc[sample.sample_id == sample_id]
     if len(selected) != 1:
-        return html.P("Probe nicht gefunden."), None, None, None
+        return html.P("Probe nicht gefunden."), None, None, None, None
     row = selected.iloc[0]
     return (
         operations.sample_detail_content(repo, sample_id),
         row.sample_name if pd.notna(row.sample_name) else "",
         row.batch_id if pd.notna(row.batch_id) else "",
         row.notes if pd.notna(row.notes) else "",
+        row.sample_type,
     )
+
+
+@app.callback(
+    Output("sample-detail-id", "data"),
+    Input("queue", "selected_row_ids"),
+    Input("queue", "active_cell"),
+    State("queue", "data"),
+    prevent_initial_call=True,
+)
+def select_sample_from_queue(selected_task_ids, active_cell, queue_rows):
+    if current_user() is None:
+        return no_update
+    if "queue.active_cell" in ctx.triggered_prop_ids:
+        task_id = (active_cell or {}).get("row_id")
+        if not task_id or task_id not in {
+            row.get("id") for row in queue_rows or []
+        }:
+            return no_update
+    elif len(selected_task_ids or []) == 1:
+        task_id = selected_task_ids[0]
+    else:
+        return no_update
+    if not task_id:
+        return no_update
+    tasks = repo.table("tasks")
+    selected = tasks.loc[tasks.task_id == task_id]
+    if len(selected) != 1:
+        return no_update
+    return selected.iloc[0].sample_id
+
+
+@app.callback(
+    Output("sample-detail-modal", "style"),
+    Input("sample-detail-id", "data"),
+)
+def show_sample_detail_modal(sample_id):
+    if current_user() is None or not sample_id:
+        return {"display": "none"}
+    return {"display": "flex"}
+
+
+@app.callback(
+    Output("sample-detail-id", "data", allow_duplicate=True),
+    Output("queue", "selected_row_ids", allow_duplicate=True),
+    Output("queue", "active_cell", allow_duplicate=True),
+    Input("sample-detail-close", "n_clicks"),
+    prevent_initial_call=True,
+)
+def close_sample_detail_modal(clicks):
+    if not clicks:
+        return no_update, no_update, no_update
+    return None, [], None
 
 
 @app.callback(
     Output("sample-edit-message", "children"),
     Output("sample-detail-revision", "data"),
     Input("sample-edit-save", "n_clicks"),
-    State("sample-detail-id", "value"),
+    State("sample-detail-id", "data"),
     State("sample-edit-name", "value"),
     State("sample-edit-batch", "value"),
     State("sample-edit-notes", "value"),
+    State("sample-edit-type", "value"),
     State("sample-edit-reason", "value"),
     State("sample-detail-revision", "data"),
     prevent_initial_call=True,
 )
 def update_sample_details(
-    clicks, sample_id, sample_name, batch_id, notes, reason, revision
+    clicks, sample_id, sample_name, batch_id, notes, sample_type, reason, revision
 ):
     if not clicks:
         return no_update, no_update
@@ -183,6 +237,7 @@ def update_sample_details(
             sample_name=sample_name,
             batch_id=batch_id,
             notes=notes,
+            sample_type=sample_type,
             reason=reason or "",
             actor=user["username"],
             actor_role=user["role"],
@@ -333,17 +388,88 @@ def sample_methods(product_id):
     if current_user() is None:
         return [], []
     method_table = repo.table("methods").set_index("method_id")
-    plan = PLANS[product_id]
+    plan = repo.table("specifications")
+    plan = plan.loc[
+        plan.product_id.eq(product_id) & plan.active.astype(bool)
+    ]
+    if plan.empty:
+        return [], []
     options = [
         {
             "label": f"{method_table.loc[method_id, 'method']} — "
                      f"{method_table.loc[method_id, 'parameter']} "
-                     f"({method_table.loc[method_id, 'unit']}) · Pflicht (Demo)",
+                     f"({method_table.loc[method_id, 'unit']}) · "
+                     f"{'Pflicht' if required else 'Zusatz'} (Demo)",
             "value": method_id,
         }
-        for method_id, _, _, _, _ in plan
+        for method_id, required in zip(plan.method_id, plan.is_required)
     ]
-    return options, [method_id for method_id, *_ in plan]
+    return options, plan.method_id.tolist()
+
+
+@app.callback(
+    Output("spec-method", "options"),
+    Output("spec-method", "value"),
+    Input("spec-product", "value"),
+)
+def specification_methods(product_id):
+    if current_user() is None or not product_id:
+        return [], None
+    active = repo.table("specifications")
+    active = active.loc[
+        active.product_id.eq(product_id) & active.active.astype(bool)
+    ]
+    methods = repo.table("methods").set_index("method_id")
+    options = [
+        {
+            "label": f"{methods.loc[row.method_id, 'method']} · "
+                     f"{methods.loc[row.method_id, 'parameter']} ({methods.loc[row.method_id, 'unit']})",
+            "value": row.method_id,
+        }
+        for row in active.itertuples()
+    ]
+    return options, options[0]["value"] if options else None
+
+
+@app.callback(
+    Output("spec-message", "children"),
+    Output("active-specification-table", "children"),
+    Input("spec-create", "n_clicks"),
+    State("spec-product", "value"),
+    State("spec-method", "value"),
+    State("spec-target", "value"),
+    State("spec-lsl", "value"),
+    State("spec-usl", "value"),
+    State("spec-sigma", "value"),
+    State("spec-reason", "value"),
+    prevent_initial_call=True,
+)
+def create_specification_version(
+    clicks, product_id, method_id, target, lsl, usl, sigma, reason
+):
+    if not clicks:
+        return no_update, no_update
+    user = current_user()
+    if user is None:
+        return "Bitte zuerst lokal anmelden.", no_update
+    try:
+        version = workflow.create_specification_version(
+            product_id or "",
+            method_id or "",
+            target=target,
+            lsl=lsl,
+            usl=usl,
+            sigma=sigma,
+            reason=reason or "",
+            actor=user["username"],
+            actor_role=user["role"],
+        )
+    except ValueError as exc:
+        return f"Keine neue Version: {exc}", operations.active_specification_content(repo)
+    return (
+        f"{version} wurde aktiviert. Bestehende Proben und Aufträge bleiben unverändert.",
+        operations.active_specification_content(repo),
+    )
 
 
 @app.callback(

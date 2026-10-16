@@ -79,6 +79,7 @@ class Repository:
                 "notes": "TEXT",
                 "created_at": "TEXT",
                 "created_by": "TEXT NOT NULL DEFAULT 'DEMO-IMPORT'",
+                "specification_version": "TEXT",
             },
             "tasks": {
                 "ordered_at": "TEXT",
@@ -89,6 +90,10 @@ class Repository:
                 "manual_deadline_reason": "TEXT",
                 "specification_version": "TEXT",
                 "calculation_rule": "TEXT",
+                "target": "REAL",
+                "lsl": "REAL",
+                "usl": "REAL",
+                "sigma": "REAL",
             },
             "results": {
                 "result_version": "INTEGER NOT NULL DEFAULT 1",
@@ -156,6 +161,51 @@ class Repository:
                 "WHERE calculation_rule IS NULL"
             )
             self._connection.commit()
+        self._ensure_demo_specifications()
+
+    def _ensure_demo_specifications(self) -> None:
+        specifications = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='specifications'"
+        ).fetchone()
+        if specifications is None:
+            frame = generate_demo_data()["specifications"]
+            self._write_table("specifications", frame)
+        with self._lock:
+            active_versions = pd.read_sql_query(
+                "SELECT product_id, version FROM specifications WHERE active = 1",
+                self._connection,
+            )
+            samples = self.table("samples")
+            if "specification_version" not in samples:
+                samples["specification_version"] = None
+            for row in active_versions.itertuples(index=False):
+                sample_mask = (
+                    samples.product_id.eq(row.product_id)
+                    & samples.specification_version.isna()
+                )
+                samples.loc[sample_mask, "specification_version"] = row.version
+            self.replace("samples", samples)
+
+            tasks = self.table("tasks")
+            specifications_frame = self.table("specifications")
+            active_specs = specifications_frame.loc[
+                specifications_frame.active.astype(bool)
+            ]
+            for spec in active_specs.itertuples(index=False):
+                mask = (
+                    tasks.product_id.eq(spec.product_id)
+                    & tasks.method_id.eq(spec.method_id)
+                    & (
+                        tasks.specification_version.isna()
+                        | tasks.target.isna()
+                    )
+                )
+                for field in ("target", "lsl", "usl", "sigma"):
+                    tasks.loc[mask, field] = getattr(spec, field)
+                tasks.loc[mask, "specification_version"] = spec.version
+                tasks.loc[mask, "calculation_rule"] = spec.calculation_rule
+                tasks.loc[mask, "is_required"] = spec.is_required
+            self.replace("tasks", tasks)
 
     def table(self, name: str) -> pd.DataFrame:
         with self._lock:
